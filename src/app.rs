@@ -21,6 +21,22 @@ use crate::engine::tonemap::{
 use crate::gpu::{self, FrameDesc, GpuInk, GpuResources, LayerDesc, PageCallback};
 use crate::icons::{icon_button, Icon};
 
+/// Ready-made ink sets for palette separations (sRGB). Paper is always white.
+const PALETTE_PRESETS: &[(&str, &[[u8; 3]])] = &[
+    ("Primaries: red, yellow, blue", &[[205, 30, 40], [250, 215, 20], [30, 70, 170]]),
+    ("Primaries + black", &[[25, 25, 25], [205, 30, 40], [250, 215, 20], [30, 70, 170]]),
+    ("Process: cyan, magenta, yellow, black", &[[0, 174, 239], [236, 0, 140], [255, 242, 0], [35, 31, 32]]),
+    ("Light RGB + black", &[[25, 25, 25], [215, 35, 40], [30, 150, 65], [30, 80, 175]]),
+    ("Black, red, yellow", &[[25, 25, 25], [210, 40, 40], [250, 215, 20]]),
+    ("Pop art", &[[25, 25, 25], [230, 30, 90], [0, 170, 230], [255, 220, 0]]),
+    ("Retro 70s", &[[60, 35, 30], [200, 80, 30], [235, 170, 40], [40, 110, 110]]),
+    ("Earth tones", &[[60, 40, 30], [170, 90, 40], [200, 160, 70], [90, 110, 60]]),
+    ("Sepia duotone", &[[60, 40, 30], [170, 120, 70]]),
+    ("Blueprint duotone", &[[20, 45, 120], [110, 160, 220]]),
+    ("Newsprint: black + red", &[[25, 25, 25], [210, 40, 40]]),
+    ("Greys: three inks", &[[30, 30, 30], [110, 110, 110], [180, 180, 180]]),
+];
+
 const ANGLE_PRESETS: [(&str, [f32; 4]); 2] = [
     ("Offset standard (C15 M75 Y0 K45)", [15.0, 75.0, 0.0, 45.0]),
     ("Alternate (C105 M75 Y90 K45)", [105.0, 75.0, 90.0, 45.0]),
@@ -1932,6 +1948,22 @@ impl HalftoneApp {
         let mut changed = false;
         let mut count_changed = false;
         let mut remove = None;
+        let mut chosen = None;
+        egui::ComboBox::from_id_salt("palette_preset").selected_text("Preset palette…").width(240.0).show_ui(
+            ui,
+            |ui| {
+                for (i, (name, cols)) in PALETTE_PRESETS.iter().enumerate() {
+                    if ui.selectable_label(false, format!("{}  ({} inks)", name, cols.len())).clicked() {
+                        chosen = Some(i);
+                    }
+                }
+            },
+        );
+        if let Some(i) = chosen {
+            self.palette = PALETTE_PRESETS[i].1.to_vec();
+            changed = true;
+            count_changed = true;
+        }
         for i in 0..self.palette.len() {
             ui.horizontal(|ui| {
                 ui.label(format!("Ink {}", i + 1));
