@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::layout::{MarkSettings, Rect};
 use super::par::par_rows;
-use super::spot::{DotShape, SpotTable};
+use super::spot::{blue_noise, DotShape, SpotTable, MASK_N};
 use super::tonemap::{Pyramid, ToneMaps};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -191,6 +191,13 @@ impl<'a> PlateEval<'a> {
         }
         if t >= 0.9999 {
             return true;
+        }
+        if self.params.shape.uses_mask() {
+            // Stochastic screen: each lattice cell is one grain, switched on by the blue-noise mask.
+            let n = MASK_N as i64;
+            let mx = iu_i.rem_euclid(n) as usize;
+            let my = iv_i.rem_euclid(n) as usize;
+            return blue_noise()[my * MASK_N + mx] <= t;
         }
         let fx = (su - iu - 0.5) as f32;
         let fy = (sv - iv - 0.5) as f32;

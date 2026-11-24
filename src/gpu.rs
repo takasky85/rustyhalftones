@@ -20,6 +20,9 @@ const LAYER_FLOATS: usize = 80;
 const FRAME_FLOATS: usize = 16 + MAX_PLATES * LAYER_FLOATS;
 /// Floats per plate in the spot table (1025 used, padded to a multiple of 4).
 pub const SPOT_STRIDE: usize = 1028;
+/// Float offset of the blue-noise mask inside the spot uniform (must match `mask_at` in the shader).
+pub const MASK_OFFSET: usize = MAX_PLATES * SPOT_STRIDE;
+pub const SPOT_FLOATS: usize = MASK_OFFSET + 64 * 64;
 /// The largest ink map the GPU path accepts (matches the biggest working-resolution choice).
 pub const MIN_TEXTURE_DIM: u32 = 6144;
 
@@ -153,7 +156,8 @@ fn build_chain(base: &[f32], w: usize, h: usize) -> Vec<Vec<u16>> {
 
 /// Spot tables for every plate, flattened for the shader. Returns the table plus `(min, inv)` per plate.
 pub fn spot_tables(tables: &[SpotTable]) -> (Vec<f32>, Vec<(f32, f32)>) {
-    let mut data = vec![0.0f32; MAX_PLATES * SPOT_STRIDE];
+    let mut data = vec![0.0f32; SPOT_FLOATS];
+    data[MASK_OFFSET..].copy_from_slice(crate::engine::spot::blue_noise());
     let mut params = Vec::new();
     for (i, t) in tables.iter().enumerate().take(MAX_PLATES) {
         let (min, inv, cum) = t.gpu_data();
@@ -347,7 +351,7 @@ impl GpuResources {
         });
         let spots_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("spot tables"),
-            size: (MAX_PLATES * SPOT_STRIDE * 4) as u64,
+            size: (SPOT_FLOATS * 4) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -562,7 +566,9 @@ mod tests {
         assert_eq!(f.to_floats().len(), FRAME_FLOATS);
         assert_eq!(FRAME_FLOATS * 4, 16 * 4 + 4 * 320);
         // the shader declares Frame as 4 vec4 + 4 layers of (5 + 12 + 3) vec4
-        assert!(SHADER.contains("array<Layer, 4>") && SHADER.contains("array<vec4<f32>, 1028>"));
+        assert!(SHADER.contains("array<Layer, 4>") && SHADER.contains("array<vec4<f32>, 2052>"));
+        assert_eq!(MASK_OFFSET, 4112);
+        assert_eq!(SPOT_FLOATS, 2052 * 4);
         assert_eq!(SPOT_STRIDE * 4, 1028 * 4);
     }
 }

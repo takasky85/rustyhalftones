@@ -10,10 +10,14 @@ pub enum DotShape {
     Square,
     RoundedSquare,
     Line,
+    /// Stochastic screen: grains placed by a blue-noise threshold mask instead of a spot function.
+    Fm,
+    /// Not a screen at all: the plate is a ready-made 1-bit raster (error diffusion, palette dither).
+    Bitmap,
 }
 
 impl DotShape {
-    pub const ALL: [DotShape; 7] = [
+    pub const ALL: [DotShape; 8] = [
         DotShape::Round,
         DotShape::Ellipse,
         DotShape::Euclidean,
@@ -21,7 +25,13 @@ impl DotShape {
         DotShape::Square,
         DotShape::RoundedSquare,
         DotShape::Line,
+        DotShape::Fm,
     ];
+
+    /// True for the shapes that use the blue-noise mask.
+    pub fn uses_mask(self) -> bool {
+        matches!(self, DotShape::Fm | DotShape::Bitmap)
+    }
 
     /// Index used by the GPU shader (same order as `ALL`).
     pub fn id(self) -> u32 {
@@ -33,6 +43,8 @@ impl DotShape {
             DotShape::Square => 4,
             DotShape::RoundedSquare => 5,
             DotShape::Line => 6,
+            DotShape::Fm => 7,
+            DotShape::Bitmap => 8,
         }
     }
 
@@ -45,6 +57,8 @@ impl DotShape {
             DotShape::Square => "Square",
             DotShape::RoundedSquare => "Rounded square",
             DotShape::Line => "Line",
+            DotShape::Fm => "FM (blue noise)",
+            DotShape::Bitmap => "Bitmap",
         }
     }
 
@@ -68,6 +82,7 @@ impl DotShape {
                 a * a + b * b
             }
             DotShape::Line => fy.abs(),
+            DotShape::Fm | DotShape::Bitmap => 0.0,
         }
     }
 }
@@ -129,5 +144,137 @@ impl SpotTable {
         let b = x as usize;
         let f = x - b as f32;
         self.cum[b] + f * (self.cum[b + 1] - self.cum[b])
+    }
+}
+
+/// Side of the blue-noise tile in cells.
+pub const MASK_N: usize = 64;
+
+/// A 64 x 64 blue-noise threshold tile (void-and-cluster), values in (0, 1), each used exactly once.
+/// Inking every cell whose value is at or below the tone gives that tone with evenly spread grains.
+pub fn blue_noise() -> &'static [f32] {
+    static MASK: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    MASK.get_or_init(generate_blue_noise)
+}
+
+fn generate_blue_noise() -> Vec<f32> {
+    const N: usize = MASK_N;
+    const NN: usize = N * N;
+    const R: i32 = 6;
+    const SIGMA: f32 = 1.5;
+    let mut kernel = Vec::new();
+    for dy in -R..=R {
+        for dx in -R..=R {
+            kernel.push((dx, dy, (-((dx * dx + dy * dy) as f32) / (2.0 * SIGMA * SIGMA)).exp()));
+        }
+    }
+    let apply = |energy: &mut Vec<f32>, idx: usize, sign: f32| {
+        let (x, y) = ((idx % N) as i32, (idx / N) as i32);
+        for &(dx, dy, w) in &kernel {
+            let i = ((y + dy).rem_euclid(N as i32) as usize) * N + (x + dx).rem_euclid(N as i32) as usize;
+            energy[i] += sign * w;
+        }
+    };
+    // deterministic start: about 10% of the cells set at random
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut pat = vec![false; NN];
+    let mut count = 0;
+    while count < NN / 10 {
+        let i = (next() % NN as u64) as usize;
+        if !pat[i] {
+            pat[i] = true;
+            count += 1;
+        }
+    }
+    let mut energy = vec![0.0f32; NN];
+    for i in 0..NN {
+        if pat[i] {
+            apply(&mut energy, i, 1.0);
+        }
+    }
+    let argmax_one = |pat: &[bool], e: &[f32]| {
+        (0..NN).filter(|&i| pat[i]).max_by(|&a, &b| e[a].total_cmp(&e[b]).then(b.cmp(&a))).unwrap()
+    };
+    let argmin_zero = |pat: &[bool], e: &[f32]| {
+        (0..NN).filter(|&i| !pat[i]).min_by(|&a, &b| e[a].total_cmp(&e[b]).then(a.cmp(&b))).unwrap()
+    };
+    // relax the initial pattern: move the tightest cluster into the largest void until it stops
+    for _ in 0..NN * 20 {
+        let c = argmax_one(&pat, &energy);
+        pat[c] = false;
+        apply(&mut energy, c, -1.0);
+        let v = argmin_zero(&pat, &energy);
+        pat[v] = true;
+        apply(&mut energy, v, 1.0);
+        if v == c {
+            break;
+        }
+    }
+    let mut rank = vec![0usize; NN];
+    // phase 1: peel the ones off, tightest cluster first, highest rank first
+    let ones = pat.iter().filter(|&&b| b).count();
+    let mut work = pat.clone();
+    let mut e = energy.clone();
+    for r in (0..ones).rev() {
+        let c = argmax_one(&work, &e);
+        rank[c] = r;
+        work[c] = false;
+        apply(&mut e, c, -1.0);
+    }
+    // phases 2 and 3: fill the largest void each time
+    let mut work = pat;
+    let mut e = energy;
+    for r in ones..NN {
+        let v = argmin_zero(&work, &e);
+        rank[v] = r;
+        work[v] = true;
+        apply(&mut e, v, 1.0);
+    }
+    rank.iter().map(|&r| (r as f32 + 0.5) / NN as f32).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blue_noise_is_a_permutation_with_even_spacing() {
+        let m = blue_noise();
+        assert_eq!(m.len(), MASK_N * MASK_N);
+        let mut seen = vec![false; m.len()];
+        for &v in m {
+            let r = (v * m.len() as f32 - 0.5).round() as usize;
+            assert!(!seen[r], "rank used twice");
+            seen[r] = true;
+        }
+        // grains at 10% tone: nearest neighbour distances stay close to the ideal spacing
+        let pts: Vec<(i32, i32)> =
+            (0..m.len()).filter(|&i| m[i] < 0.10).map(|i| ((i % MASK_N) as i32, (i / MASK_N) as i32)).collect();
+        let n = MASK_N as i32;
+        let (mut min_d, mut sum) = (f32::MAX, 0.0f32);
+        for (i, a) in pts.iter().enumerate() {
+            let mut best = f32::MAX;
+            for (j, b) in pts.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let dx = (a.0 - b.0).abs().min(n - (a.0 - b.0).abs()) as f32;
+                let dy = (a.1 - b.1).abs().min(n - (a.1 - b.1).abs()) as f32;
+                best = best.min((dx * dx + dy * dy).sqrt());
+            }
+            min_d = min_d.min(best);
+            sum += best;
+        }
+        let ideal = (m.len() as f32 / pts.len() as f32).sqrt();
+        let mean = sum / pts.len() as f32;
+        println!("blue noise: {} points, ideal {:.2}, min {:.2}, mean {:.2}", pts.len(), ideal, min_d, mean);
+        assert!(min_d >= 0.55 * ideal, "clumped: min {} vs ideal {}", min_d, ideal);
+        assert!(mean >= 0.8 * ideal, "mean {} vs ideal {}", mean, ideal);
     }
 }

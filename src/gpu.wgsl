@@ -25,7 +25,7 @@ struct Frame {
 };
 
 struct Spots {
-    cum: array<vec4<f32>, 1028>,       // 4 plates x 1028 floats
+    cum: array<vec4<f32>, 2052>,       // 4 plates x 1028 floats, then the 64 x 64 blue-noise mask
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -46,6 +46,12 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
 
 fn cum_at(i: u32) -> f32 {
     return spots.cum[i / 4u][i % 4u];
+}
+
+fn mask_at(ix: f32, iy: f32) -> f32 {
+    let mx = u32(ix - 64.0 * floor(ix / 64.0));
+    let my = u32(iy - 64.0 * floor(iy / 64.0));
+    return cum_at(4112u + my * 64u + mx);
 }
 
 fn spot_raw(shape: i32, fx: f32, fy: f32, elong: f32) -> f32 {
@@ -179,6 +185,12 @@ fn is_on(li: u32, x: f32, y: f32) -> f32 {
     }
     if t >= 0.9999 {
         return 1.0;
+    }
+    if frame.layers[li].p2.y > 6.5 {
+        if mask_at(iu, iv) <= t {
+            return 1.0;
+        }
+        return 0.0;
     }
     let fx = su - iu - 0.5;
     let fy = sv - iv - 0.5;
