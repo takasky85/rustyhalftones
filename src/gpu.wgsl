@@ -4,7 +4,7 @@
 
 const TAU: f32 = 6.2831853;
 const BINS: f32 = 1024.0;
-const MAX_LAYERS: u32 = 4u;
+const MAX_LAYERS: u32 = 8u;
 
 struct Layer {
     ink: vec4<f32>,                    // rgb, unused
@@ -21,11 +21,11 @@ struct Frame {
     image: vec4<f32>,                  // image rect x, y, w, h (page mm)
     hdr1: vec4<f32>,                   // page w, page h, dots (1) or tone (0), antialias
     hdr2: vec4<f32>,                   // max lod, ink map base width, target is sRGB, unused
-    layers: array<Layer, 4>,
+    layers: array<Layer, 8>,
 };
 
 struct Spots {
-    cum: array<vec4<f32>, 2052>,       // 4 plates x 1028 floats, then the 64 x 64 blue-noise mask
+    cum: array<vec4<f32>, 3080>,       // 8 plates x 1028 floats, then the 64 x 64 blue-noise mask
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -51,7 +51,7 @@ fn cum_at(i: u32) -> f32 {
 fn mask_at(ix: f32, iy: f32) -> f32 {
     let mx = u32(ix - 64.0 * floor(ix / 64.0));
     let my = u32(iy - 64.0 * floor(iy / 64.0));
-    return cum_at(4112u + my * 64u + mx);
+    return cum_at(8224u + my * 64u + mx);
 }
 
 fn spot_raw(shape: i32, fx: f32, fy: f32, elong: f32) -> f32 {
@@ -113,6 +113,9 @@ fn dot_gain_comp(t: f32, g0: f32) -> f32 {
 fn adjust_tone(li: u32, raw: f32) -> f32 {
     let p1 = frame.layers[li].p1;
     var t = clamp(raw, 0.0, 1.0);
+    if frame.layers[li].p2.y > 7.5 {
+        return t;
+    }
     if frame.layers[li].p2.x > 0.5 {
         t = 1.0 - t;
     }
@@ -165,6 +168,13 @@ fn is_on(li: u32, x: f32, y: f32) -> f32 {
     if region < 0 {
         return 0.0;
     }
+    if region == 0 && frame.layers[li].p2.y > 7.5 {
+        let im = frame.image;
+        let dims = vec2<f32>(textureDimensions(ink_tex).xy);
+        let uv = clamp(vec2<f32>((x - im.x) / im.z, (y - im.y) / im.w), vec2<f32>(0.0), vec2<f32>(0.99999));
+        let px = vec2<i32>(floor(uv * dims));
+        return select(0.0, 1.0, textureLoad(ink_tex, px, i32(frame.layers[li].p3.y), 0).r > 0.5);
+    }
     let p0 = frame.layers[li].p0;
     let c = p0.x;
     let s = p0.y;
@@ -187,6 +197,7 @@ fn is_on(li: u32, x: f32, y: f32) -> f32 {
         return 1.0;
     }
     if frame.layers[li].p2.y > 6.5 {
+        // FM screen, and the patches of a dithered plate
         if mask_at(iu, iv) <= t {
             return 1.0;
         }

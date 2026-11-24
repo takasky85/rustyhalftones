@@ -1,6 +1,8 @@
 //! Source image -> per-plate ink maps (0 = no ink, 1 = full ink) with a mip pyramid
 //! so each halftone cell can be sampled with an area average of its own size.
+use super::dither::{dither_palette, dither_plane, DitherSettings};
 use super::par::par_rows;
+use super::render::dot_gain_compensate;
 
 #[derive(Clone)]
 pub struct SourceImage {
@@ -81,6 +83,8 @@ pub enum SepMode {
     Mono,
     /// Four plates: C, M, Y, K.
     Cmyk,
+    /// A handful of spot inks; every grain of the image gets one ink (or bare paper).
+    Palette,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -149,6 +153,15 @@ impl Pyramid {
         &self.levels[0].2
     }
 
+    /// Value of the base-level pixel containing normalised position (u, v), no filtering.
+    #[inline]
+    pub fn nearest(&self, u: f32, v: f32) -> f32 {
+        let (w, h, d) = (self.levels[0].0, self.levels[0].1, &self.levels[0].2);
+        let x = ((u * w as f32) as usize).min(w - 1);
+        let y = ((v * h as f32) as usize).min(h - 1);
+        d[y * w + x]
+    }
+
     pub fn base_size(&self) -> (usize, usize) {
         (self.levels[0].0, self.levels[0].1)
     }
@@ -191,9 +204,8 @@ pub struct ToneMaps {
     pub plates: Vec<Pyramid>,
 }
 
-/// Separate `src` into ink maps. `max_side` caps the working resolution (long side).
-pub fn build_tone_maps(src: &SourceImage, ts: &ToneSettings, max_side: usize) -> ToneMaps {
-    let work = src.downscaled(max_side);
+/// Colour separation of an already-sized image into ink planes (0 = no ink, 1 = full ink).
+fn separate_planes(work: &SourceImage, ts: &ToneSettings) -> Vec<Vec<f32>> {
     let lut = adjust_lut(ts);
     let (w, h) = (work.w, work.h);
     let mut px = vec![[0.0f32; 4]; w * h];
@@ -206,7 +218,7 @@ pub fn build_tone_maps(src: &SourceImage, ts: &ToneSettings, max_side: usize) ->
             let g = lut[work.rgb[i + 1] as usize];
             let b = lut[work.rgb[i + 2] as usize];
             *o = match mode {
-                SepMode::Mono => {
+                SepMode::Mono | SepMode::Palette => {
                     let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
                     [1.0 - luma, 0.0, 0.0, 0.0]
                 }
@@ -223,12 +235,105 @@ pub fn build_tone_maps(src: &SourceImage, ts: &ToneSettings, max_side: usize) ->
             };
         }
     });
-    let n = if mode == SepMode::Mono { 1 } else { 4 };
-    let plates = (0..n)
-        .map(|c| {
-            let plane: Vec<f32> = px.iter().map(|p| p[c]).collect();
-            Pyramid::new(w, h, plane)
-        })
-        .collect();
-    ToneMaps { mode, plates }
+    let n = if mode == SepMode::Cmyk { 4 } else { 1 };
+    (0..n).map(|c| px.iter().map(|p| p[c]).collect()).collect()
+}
+
+/// Separate `src` into ink maps. `max_side` caps the working resolution (long side).
+pub fn build_tone_maps(src: &SourceImage, ts: &ToneSettings, max_side: usize) -> ToneMaps {
+    let work = src.downscaled(max_side);
+    let (w, h) = (work.w, work.h);
+    let plates = separate_planes(&work, ts).into_iter().map(|plane| Pyramid::new(w, h, plane)).collect();
+    ToneMaps { mode: ts.mode, plates }
+}
+
+/// Scale `src` to exactly `w` x `h` pixels, averaging when shrinking.
+pub fn resize_area(src: &SourceImage, w: usize, h: usize) -> SourceImage {
+    let (w, h) = (w.max(1), h.max(1));
+    let mut cur = src.clone();
+    while cur.w / 2 >= w && cur.h / 2 >= h {
+        cur = cur.halved();
+    }
+    if cur.w == w && cur.h == h {
+        return cur;
+    }
+    let mut out = vec![0u8; w * h * 3];
+    let (sx, sy) = (cur.w as f32 / w as f32, cur.h as f32 / h as f32);
+    for y in 0..h {
+        let fy = ((y as f32 + 0.5) * sy - 0.5).clamp(0.0, (cur.h - 1) as f32);
+        let (y0, ty) = (fy.floor() as usize, fy - fy.floor());
+        let y1 = (y0 + 1).min(cur.h - 1);
+        for x in 0..w {
+            let fx = ((x as f32 + 0.5) * sx - 0.5).clamp(0.0, (cur.w - 1) as f32);
+            let (x0, tx) = (fx.floor() as usize, fx - fx.floor());
+            let x1 = (x0 + 1).min(cur.w - 1);
+            for c in 0..3 {
+                let p = |xx: usize, yy: usize| cur.rgb[(yy * cur.w + xx) * 3 + c] as f32;
+                let top = p(x0, y0) * (1.0 - tx) + p(x1, y0) * tx;
+                let bot = p(x0, y1) * (1.0 - tx) + p(x1, y1) * tx;
+                out[(y * w + x) * 3 + c] = (top * (1.0 - ty) + bot * ty + 0.5) as u8;
+            }
+        }
+    }
+    SourceImage { w, h, rgb: out }
+}
+
+/// Everything the dithered separation needs besides the image and tone settings.
+#[derive(Clone, Debug)]
+pub struct DitherJob {
+    pub ds: DitherSettings,
+    /// Spot inks (sRGB 0..1), used in `SepMode::Palette`.
+    pub inks: Vec<[f32; 3]>,
+    pub paper: [f32; 3],
+    /// Size the image will be printed at, in mm, which with `grain_dpi` fixes the grain count.
+    pub w_mm: f32,
+    pub h_mm: f32,
+    /// Dot gain to compensate for in the single-ink modes (fraction at 50%).
+    pub dot_gain: f32,
+}
+
+/// Largest dithered raster, in grains. Beyond this the grain is enlarged to fit.
+pub const MAX_GRAINS: f64 = 24.0e6;
+/// Longest side of a dithered raster, so it always fits a GPU texture.
+pub const MAX_GRAIN_SIDE: f64 = 6144.0;
+
+/// Size of the dithered raster (in grains) for an image printed `w_mm` x `h_mm` at `dpi`.
+pub fn grain_size(w_mm: f32, h_mm: f32, dpi: f32) -> (usize, usize) {
+    let k = dpi.max(10.0) as f64 / 25.4;
+    let (mut gw, mut gh) = ((w_mm as f64 * k).max(8.0), (h_mm as f64 * k).max(8.0));
+    let over = gw * gh / MAX_GRAINS;
+    if over > 1.0 {
+        let f = over.sqrt();
+        gw /= f;
+        gh /= f;
+    }
+    let long = gw.max(gh);
+    if long > MAX_GRAIN_SIDE {
+        let f = long / MAX_GRAIN_SIDE;
+        gw /= f;
+        gh /= f;
+    }
+    (gw.round() as usize, gh.round() as usize)
+}
+
+/// Separate and dither: the maps hold only 0 and 1, one grain per pixel.
+pub fn build_dither_maps(src: &SourceImage, ts: &ToneSettings, job: &DitherJob) -> ToneMaps {
+    let (gw, gh) = grain_size(job.w_mm, job.h_mm, job.ds.grain_dpi);
+    let work = resize_area(src, gw, gh);
+    let planes: Vec<Vec<f32>> = if ts.mode == SepMode::Palette {
+        let lut = adjust_lut(ts);
+        dither_palette(&work, &job.inks, job.paper, &job.ds, Some(&lut))
+    } else {
+        let mut planes = separate_planes(&work, ts);
+        for (i, plane) in planes.iter_mut().enumerate() {
+            if job.dot_gain.abs() > 1e-4 {
+                for v in plane.iter_mut() {
+                    *v = dot_gain_compensate(*v, job.dot_gain);
+                }
+            }
+            *plane = dither_plane(gw, gh, plane, &job.ds, i);
+        }
+        planes
+    };
+    ToneMaps { mode: ts.mode, plates: planes.into_iter().map(|p| Pyramid::new(gw, gh, p)).collect() }
 }

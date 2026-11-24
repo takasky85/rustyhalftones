@@ -134,3 +134,59 @@ fn separation_and_export_produce_valid_files() {
     let png = std::fs::read(dir.join("rustyhalftones_test_K.png")).unwrap();
     assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
 }
+
+#[test]
+fn dithered_plates_print_the_requested_ink_area_and_palette_plates_stay_disjoint() {
+    use super::dither::*;
+    // flat mid grey 60x60 mm image
+    let src = SourceImage::new(16, 16, vec![128u8; 16 * 16 * 3]);
+    let image = Rect::new(0.0, 0.0, 60.0, 60.0);
+    let job = DitherJob {
+        ds: DitherSettings { algo: DitherAlgo::FloydSteinberg, serpentine: true, grain_dpi: 100.0 },
+        inks: vec![[0.0, 0.0, 0.0]],
+        paper: [1.0, 1.0, 1.0],
+        w_mm: 60.0,
+        h_mm: 60.0,
+        dot_gain: 0.0,
+    };
+    let ts = ToneSettings { mode: SepMode::Mono, ..Default::default() };
+    let maps = build_dither_maps(&src, &ts, &job);
+    assert_eq!(maps.plates.len(), 1);
+    let spot = SpotTable::new(DotShape::Bitmap, 1.0);
+    let params = PlateParams { shape: DotShape::Bitmap, lpi: 100.0, ..Default::default() };
+    let ev = PlateEval::new(params, &spot, &maps.plates[0], image, &[]);
+    let mut cell = Cell::default();
+    let n = 400;
+    let mut on = 0;
+    for j in 0..n {
+        for i in 0..n {
+            if ev.is_on((i as f32 + 0.5) * 60.0 / n as f32, (j as f32 + 0.5) * 60.0 / n as f32, &mut cell) {
+                on += 1;
+            }
+        }
+    }
+    let area = on as f32 / (n * n) as f32;
+    // grey 128 is about 50% ink in this simple separation
+    assert!(
+        (area - (1.0 - 0.7152 * 128.0 / 255.0 - 0.2126 * 128.0 / 255.0 - 0.0722 * 128.0 / 255.0)).abs() < 0.03,
+        "area {}",
+        area
+    );
+
+    // palette: two inks, no grain printed twice
+    let mut rgb = Vec::new();
+    for y in 0..16 {
+        for x in 0..16 {
+            rgb.extend_from_slice(&[(x * 16) as u8, (y * 16) as u8, 90]);
+        }
+    }
+    let src = SourceImage::new(16, 16, rgb);
+    let job = DitherJob { inks: vec![[0.9, 0.1, 0.1], [0.1, 0.1, 0.8]], ..job };
+    let ts = ToneSettings { mode: SepMode::Palette, ..Default::default() };
+    let maps = build_dither_maps(&src, &ts, &job);
+    assert_eq!(maps.plates.len(), 2);
+    let (w, h) = maps.plates[0].base_size();
+    for i in 0..w * h {
+        assert!(maps.plates[0].base_data()[i] + maps.plates[1].base_data()[i] <= 1.0);
+    }
+}

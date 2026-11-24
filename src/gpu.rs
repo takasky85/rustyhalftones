@@ -13,8 +13,8 @@ use crate::engine::spot::SpotTable;
 use crate::engine::tonemap::ToneMaps;
 
 pub const SHADER: &str = include_str!("gpu.wgsl");
-/// The shader holds up to this many plates (CMYK).
-pub const MAX_PLATES: usize = 4;
+/// The shader holds up to this many plates (CMYK, or a palette of spot inks).
+pub const MAX_PLATES: usize = 8;
 const MAX_PATCHES: usize = 12;
 const LAYER_FLOATS: usize = 80;
 const FRAME_FLOATS: usize = 16 + MAX_PLATES * LAYER_FLOATS;
@@ -378,7 +378,7 @@ impl GpuResources {
             size: wgpu::Extent3d {
                 width: ink.w as u32,
                 height: ink.h as u32,
-                depth_or_array_layers: MAX_PLATES as u32,
+                depth_or_array_layers: ink.plates.max(1) as u32,
             },
             mip_level_count: levels as u32,
             sample_count: 1,
@@ -564,11 +564,11 @@ mod tests {
             layers: vec![layer],
         };
         assert_eq!(f.to_floats().len(), FRAME_FLOATS);
-        assert_eq!(FRAME_FLOATS * 4, 16 * 4 + 4 * 320);
-        // the shader declares Frame as 4 vec4 + 4 layers of (5 + 12 + 3) vec4
-        assert!(SHADER.contains("array<Layer, 4>") && SHADER.contains("array<vec4<f32>, 2052>"));
-        assert_eq!(MASK_OFFSET, 4112);
-        assert_eq!(SPOT_FLOATS, 2052 * 4);
+        assert_eq!(FRAME_FLOATS * 4, 16 * 4 + 8 * 320);
+        // the shader declares Frame as 4 vec4 + 8 layers of (5 + 12 + 3) vec4
+        assert!(SHADER.contains("array<Layer, 8>") && SHADER.contains("array<vec4<f32>, 3080>"));
+        assert_eq!(MASK_OFFSET, 8224);
+        assert_eq!(SPOT_FLOATS, 3080 * 4);
         assert_eq!(SPOT_STRIDE * 4, 1028 * 4);
     }
 }
@@ -663,6 +663,10 @@ mod gpu_tests {
     }
 
     fn compare(shape: DotShape, ppmm: f32, dots: bool, max_bad_fraction: f32, max_mean_diff: f32) {
+        compare_with(shape, ppmm, dots, max_bad_fraction, max_mean_diff, false);
+    }
+
+    fn compare_with(shape: DotShape, ppmm: f32, dots: bool, max_bad_fraction: f32, max_mean_diff: f32, dithered: bool) {
         let Some((device, queue)) = adapter_and_device() else {
             println!("no GPU adapter, skipping");
             return;
@@ -683,7 +687,23 @@ mod gpu_tests {
         }
         let src = SourceImage::new(iw, ih, rgb);
         let ts = ToneSettings { mode: SepMode::Mono, ..ToneSettings::default() };
-        let maps = build_tone_maps(&src, &ts, 1024);
+        let maps = if dithered {
+            let job = crate::engine::tonemap::DitherJob {
+                ds: crate::engine::dither::DitherSettings {
+                    algo: crate::engine::dither::DitherAlgo::FloydSteinberg,
+                    serpentine: true,
+                    grain_dpi: 60.0,
+                },
+                inks: vec![],
+                paper: [1.0; 3],
+                w_mm: 64.0,
+                h_mm: 48.0,
+                dot_gain: 0.0,
+            };
+            crate::engine::tonemap::build_dither_maps(&src, &ts, &job)
+        } else {
+            build_tone_maps(&src, &ts, 1024)
+        };
         let ink = GpuInk::from_maps(&maps).expect("ink");
         eprintln!("stage: uploading ink {}x{}", ink.w, ink.h);
         res.set_ink(&device, &queue, &ink, 1);
@@ -768,6 +788,11 @@ mod gpu_tests {
         for s in DotShape::ALL {
             compare(s, 8.0, true, 0.01, 0.01);
         }
+    }
+
+    #[test]
+    fn gpu_dithered_bitmap_matches_cpu() {
+        compare_with(DotShape::Bitmap, 4.0, true, 0.005, 0.01, true);
     }
 
     #[test]

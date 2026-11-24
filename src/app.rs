@@ -9,12 +9,15 @@ use std::time::Duration;
 use eframe::egui::{self, pos2, vec2, Color32, Pos2, Stroke, Vec2};
 
 use crate::compress::zlib;
+use crate::engine::dither::{auto_palette, DitherAlgo, DitherSettings};
 use crate::engine::export::{export_all, ExportSpec, PlateOut};
 use crate::engine::layout::{MarkSettings, Prim, Rect as MmRect};
 use crate::engine::pages::{Unit, PAGE_SIZES};
 use crate::engine::render::{render_composite, PlateEval, PlateParams, PlateSetup, Region, Scene};
 use crate::engine::spot::{DotShape, SpotTable};
-use crate::engine::tonemap::{build_tone_maps, SepMode, SourceImage, ToneMaps, ToneSettings};
+use crate::engine::tonemap::{
+    build_dither_maps, build_tone_maps, grain_size, DitherJob, SepMode, SourceImage, ToneMaps, ToneSettings,
+};
 use crate::gpu::{self, FrameDesc, GpuInk, GpuResources, LayerDesc, PageCallback};
 use crate::icons::{icon_button, Icon};
 
@@ -153,11 +156,22 @@ impl PlateUi {
     }
 }
 
+/// What the dithered rasters depend on besides the picture: they are made at the printed grain size.
+#[derive(Clone, Copy, PartialEq)]
+struct DitherKey {
+    ds: DitherSettings,
+    gw: usize,
+    gh: usize,
+    pal_rev: u64,
+    gain_milli: i32,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 struct MapsKey {
     source_rev: u64,
     tone: ToneSettings,
     work_res: usize,
+    dither: Option<DitherKey>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -258,6 +272,14 @@ pub struct HalftoneApp {
     elong: f32,
     plates: Vec<PlateUi>,
     marks: MarkSettings,
+    /// Dither instead of halftone dots (mono / CMYK); always on in palette mode.
+    screen_dither: bool,
+    dither: DitherSettings,
+    /// Dot gain compensation for dithered plates, percent.
+    dither_gain: f32,
+    palette: Vec<[u8; 3]>,
+    pal_rev: u64,
+    pal_n: usize,
 
     fit_kind: Option<FitKind>,
     fit_key_last: [f32; 8],
@@ -427,6 +449,12 @@ impl HalftoneApp {
             elong: 1.4,
             plates: Vec::new(),
             marks: MarkSettings::default(),
+            screen_dither: false,
+            dither: DitherSettings::default(),
+            dither_gain: 0.0,
+            palette: vec![[200, 30, 30], [30, 70, 170], [25, 25, 25]],
+            pal_rev: 0,
+            pal_n: 4,
             fit_kind: Some(FitKind::Page),
             fit_key_last: [0.0; 8],
             safe_margin: 6.35,
@@ -523,7 +551,7 @@ impl HalftoneApp {
 
     fn settings_text(&self) -> String {
         format!(
-            "ui_scale={}\nunit={}\nlayout={}\nsafe_margin={}\nrenderer={}\nshow_safe={}\nrulers={}\nshow_marks={}\nplate_colors={}\naa={}\nalways_dots={}\n",
+            "ui_scale={}\nunit={}\nlayout={}\nsafe_margin={}\nrenderer={}\nshow_safe={}\nrulers={}\nshow_marks={}\nplate_colors={}\naa={}\nalways_dots={}\nscreen_dither={}\ndither_algo={}\ndither_serp={}\ngrain_dpi={}\ndither_gain={}\n",
             self.ui_scale,
             if self.unit == Unit::Mm { "mm" } else { "in" },
             self.layout.key(),
@@ -534,7 +562,12 @@ impl HalftoneApp {
             self.show_marks,
             self.plate_colors,
             self.aa,
-            self.always_dots
+            self.always_dots,
+            self.screen_dither,
+            self.dither.algo.id(),
+            self.dither.serpentine,
+            self.dither.grain_dpi,
+            self.dither_gain
         )
     }
 
@@ -567,6 +600,23 @@ impl HalftoneApp {
                 "plate_colors" => self.plate_colors = b,
                 "aa" => self.aa = b,
                 "always_dots" => self.always_dots = b,
+                "screen_dither" => self.screen_dither = b,
+                "dither_algo" => {
+                    if let Ok(x) = v.parse::<u8>() {
+                        self.dither.algo = DitherAlgo::from_id(x);
+                    }
+                }
+                "dither_serp" => self.dither.serpentine = b,
+                "grain_dpi" => {
+                    if let Ok(x) = v.parse::<f32>() {
+                        self.dither.grain_dpi = x.clamp(30.0, 1200.0);
+                    }
+                }
+                "dither_gain" => {
+                    if let Ok(x) = v.parse::<f32>() {
+                        self.dither_gain = x.clamp(0.0, 25.0);
+                    }
+                }
                 _ => {}
             }
         }
@@ -598,21 +648,34 @@ impl HalftoneApp {
                 PlateUi::new("Y", [255, 242, 0], 0.0),
                 PlateUi::new("K", [35, 31, 32], 45.0),
             ],
+            SepMode::Palette => self
+                .palette
+                .iter()
+                .enumerate()
+                .map(|(i, c)| PlateUi::new(&format!("Ink {}", i + 1), *c, 45.0))
+                .collect(),
         };
         self.view_mode = ViewMode::Composite;
     }
 
+    fn dither_active(&self) -> bool {
+        self.tone.mode == SepMode::Palette || self.screen_dither
+    }
+
     fn scene(&self) -> Scene {
         let (pw, ph) = self.page_mm();
+        let dither = self.dither_active();
+        let palette_mode = self.tone.mode == SepMode::Palette;
         let plates = self
             .plates
             .iter()
-            .map(|p| PlateSetup {
+            .enumerate()
+            .map(|(i, p)| PlateSetup {
                 name: p.name.clone(),
                 params: PlateParams {
                     angle_deg: p.angle,
-                    lpi: p.lpi_override.unwrap_or(self.lpi),
-                    shape: p.shape_override.unwrap_or(self.shape),
+                    lpi: if dither { self.dither.grain_dpi } else { p.lpi_override.unwrap_or(self.lpi) },
+                    shape: if dither { DotShape::Bitmap } else { p.shape_override.unwrap_or(self.shape) },
                     elong: self.elong,
                     dot_gain: p.dot_gain / 100.0,
                     min_dot: p.min_dot / 100.0,
@@ -620,7 +683,10 @@ impl HalftoneApp {
                     dropout: p.dropout / 100.0,
                     invert: p.invert,
                 },
-                ink: [p.ink[0] as f32 / 255.0, p.ink[1] as f32 / 255.0, p.ink[2] as f32 / 255.0],
+                ink: {
+                    let c = if palette_mode { self.palette.get(i).copied().unwrap_or(p.ink) } else { p.ink };
+                    [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]
+                },
                 visible: p.visible,
             })
             .collect();
@@ -767,20 +833,51 @@ impl HalftoneApp {
         }
     }
 
+    fn maps_key_now(&self) -> MapsKey {
+        let dither = if self.dither_active() {
+            let (gw, gh) = grain_size(self.place.w, self.place.h, self.dither.grain_dpi);
+            Some(DitherKey {
+                ds: self.dither,
+                gw,
+                gh,
+                pal_rev: self.pal_rev,
+                gain_milli: (self.dither_gain * 10.0).round() as i32,
+            })
+        } else {
+            None
+        };
+        MapsKey { source_rev: self.source_rev, tone: self.tone, work_res: self.work_res, dither }
+    }
+
     fn maybe_build_maps(&mut self) {
         let Some(src) = self.source.clone() else { return };
         if self.maps_building.is_some() {
             return;
         }
-        let key = MapsKey { source_rev: self.source_rev, tone: self.tone, work_res: self.work_res };
+        let key = self.maps_key_now();
         if self.maps_key == Some(key) {
             return;
         }
         self.maps_building = Some(key);
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
+        let job = key.dither.map(|dk| DitherJob {
+            ds: dk.ds,
+            inks: self
+                .palette
+                .iter()
+                .map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0])
+                .collect(),
+            paper: [1.0; 3],
+            w_mm: self.place.w,
+            h_mm: self.place.h,
+            dot_gain: self.dither_gain / 100.0,
+        });
         thread::spawn(move || {
-            let maps = build_tone_maps(&src, &key.tone, key.work_res);
+            let maps = match &job {
+                Some(job) => build_dither_maps(&src, &key.tone, job),
+                None => build_tone_maps(&src, &key.tone, key.work_res),
+            };
             let _ = tx.send(Msg::Maps { key, maps: Arc::new(maps) });
             ctx.request_repaint();
         });
@@ -1093,7 +1190,10 @@ impl HalftoneApp {
             return;
         };
         let scene = self.scene();
-        if maps.plates.len() != scene.plates.len() || self.maps_key.map(|k| k.source_rev) != Some(self.source_rev) {
+        if maps.plates.len() != scene.plates.len()
+            || self.maps_key.map(|k| k.source_rev) != Some(self.source_rev)
+            || (self.dither_active() && self.maps_key != Some(self.maps_key_now()))
+        {
             self.status = "Still processing the image, try again in a moment.".to_string();
             return;
         }
@@ -1745,11 +1845,16 @@ impl HalftoneApp {
         section(ui, "Separation");
         let mut mode = self.tone.mode;
         egui::ComboBox::from_id_salt("sep_mode")
-            .selected_text(if mode == SepMode::Mono { "Single plate (greyscale)" } else { "CMYK (4 plates)" })
+            .selected_text(match mode {
+                SepMode::Mono => "Single plate (greyscale)",
+                SepMode::Cmyk => "CMYK (4 plates)",
+                SepMode::Palette => "Spot colours (palette)",
+            })
             .width(240.0)
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut mode, SepMode::Mono, "Single plate (greyscale)");
                 ui.selectable_value(&mut mode, SepMode::Cmyk, "CMYK (4 plates)");
+                ui.selectable_value(&mut mode, SepMode::Palette, "Spot colours (palette)");
             });
         if mode != self.tone.mode {
             self.tone.mode = mode;
@@ -1769,10 +1874,38 @@ impl HalftoneApp {
                     ui.selectable_value(&mut self.work_res, r, format!("{} px (long side)", r));
                 }
             });
-        ui.label("Plain RGB to CMYK, no ICC profiles.");
+        if self.tone.mode == SepMode::Palette {
+            ui.label("Each grain of the picture is printed with the nearest spot ink or left as bare paper.");
+            self.palette_ui(ui);
+        } else {
+            ui.label("Plain RGB to CMYK, no ICC profiles.");
+        }
 
-        section(ui, "Screen (halftone)");
-        ui.add(egui::Slider::new(&mut self.lpi, 10.0..=150.0).text("Lines per inch"));
+        if self.tone.mode == SepMode::Palette {
+            section(ui, "Dither");
+            self.dither_ui(ui);
+            return;
+        }
+        section(ui, "Screen");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.screen_dither, false, "Halftone dots");
+            ui.selectable_value(&mut self.screen_dither, true, "Dither (grains)");
+        });
+        if self.screen_dither {
+            self.dither_ui(ui);
+            return;
+        }
+        if self.shape == DotShape::Fm {
+            ui.label(format!(
+                "FM screen: one grain is {:.0} µm, placed by a blue-noise mask, so there is no angle and no moiré.",
+                25400.0 / self.lpi.max(1.0)
+            ));
+        }
+        ui.add(egui::Slider::new(&mut self.lpi, 10.0..=150.0).text(if self.shape == DotShape::Fm {
+            "Grains per inch"
+        } else {
+            "Lines per inch"
+        }));
         ui.horizontal(|ui| {
             ui.label("Mesh");
             ui.add(egui::DragValue::new(&mut self.mesh).speed(1.0).range(40.0..=500.0).suffix(" tpi"));
@@ -1794,11 +1927,121 @@ impl HalftoneApp {
         }
     }
 
+    fn palette_ui(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Inks");
+        let mut changed = false;
+        let mut count_changed = false;
+        let mut remove = None;
+        for i in 0..self.palette.len() {
+            ui.horizontal(|ui| {
+                ui.label(format!("Ink {}", i + 1));
+                if ui.color_edit_button_srgb(&mut self.palette[i]).changed() {
+                    changed = true;
+                }
+                if ui.add_enabled(self.palette.len() > 1, egui::Button::new("Remove").small()).clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.palette.remove(i);
+            changed = true;
+            count_changed = true;
+        }
+        ui.horizontal(|ui| {
+            if ui.add_enabled(self.palette.len() < 8, egui::Button::new("Add ink")).clicked() {
+                self.palette.push([128, 128, 128]);
+                changed = true;
+                count_changed = true;
+            }
+            ui.label("Pick");
+            ui.add(egui::DragValue::new(&mut self.pal_n).range(1..=8));
+            ui.label("from the image");
+            if ui.add_enabled(self.source.is_some(), egui::Button::new("Go")).clicked() {
+                if let Some(src) = &self.source {
+                    let pal = auto_palette(src, self.pal_n, [1.0; 3]);
+                    self.palette = pal
+                        .iter()
+                        .map(|c| {
+                            [(c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8]
+                        })
+                        .collect();
+                    changed = true;
+                    count_changed = true;
+                }
+            }
+        });
+        ui.label("Paper is white. A grain gets one ink or none, so plates never overlap: no overprint, no trapping.");
+        if changed {
+            self.pal_rev += 1;
+        }
+        if count_changed {
+            self.reset_plates();
+        }
+    }
+
+    fn dither_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Algorithm");
+            egui::ComboBox::from_id_salt("dither_algo").selected_text(self.dither.algo.name()).show_ui(ui, |ui| {
+                for a in DitherAlgo::ALL {
+                    ui.selectable_value(&mut self.dither.algo, a, a.name());
+                }
+            });
+        });
+        if self.dither.algo.is_diffusion() {
+            ui.checkbox(&mut self.dither.serpentine, "Serpentine scan (alternate row direction)");
+        }
+        ui.add(
+            egui::Slider::new(&mut self.dither.grain_dpi, 50.0..=600.0).logarithmic(true).text("Grain").suffix(" dpi"),
+        );
+        if self.tone.mode != SepMode::Palette {
+            ui.add(egui::Slider::new(&mut self.dither_gain, 0.0..=25.0).text("Dot gain comp.").suffix("%"));
+        }
+        let (gw, gh) = grain_size(self.place.w, self.place.h, self.dither.grain_dpi);
+        ui.label(format!(
+            "{} x {} grains, each {:.0} µm. Pick a grain your mesh and emulsion can hold, usually 150 µm or more.",
+            gw,
+            gh,
+            25400.0 / (gw as f32 / (self.place.w / 25.4).max(1e-3)).max(1.0)
+        ));
+    }
+
     fn tab_plates(&mut self, ui: &mut egui::Ui) {
         if self.plates.is_empty() {
             return;
         }
         self.sel_plate = self.sel_plate.min(self.plates.len() - 1);
+        if self.dither_active() {
+            section(ui, "All plates");
+            let palette_mode = self.tone.mode == SepMode::Palette;
+            let mut preview = None;
+            egui::Grid::new("plates_grid_dither").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+                ui.label("");
+                ui.label("Ink");
+                ui.label("Show");
+                ui.end_row();
+                for (i, p) in self.plates.iter_mut().enumerate() {
+                    if ui.selectable_label(self.sel_plate == i, format!("  {}  ", p.name)).clicked() {
+                        self.sel_plate = i;
+                        preview = Some(i);
+                    }
+                    if palette_mode {
+                        let c = self.palette.get(i).copied().unwrap_or(p.ink);
+                        ui.colored_label(Color32::from_rgb(c[0], c[1], c[2]), "■■■");
+                    } else {
+                        ui.color_edit_button_srgb(&mut p.ink);
+                    }
+                    ui.checkbox(&mut p.visible, "");
+                    ui.end_row();
+                }
+            });
+            if let Some(i) = preview {
+                self.view_mode = ViewMode::Plate(i);
+            }
+            ui.label("Dithered plates are single-dot rasters: angle, dot shape and the min/max dot limits do not apply. Change the ink colours under Separation.");
+            return;
+        }
         section(ui, "All plates");
         egui::Grid::new("plates_grid").num_columns(4).spacing([12.0, 6.0]).show(ui, |ui| {
             ui.label("");

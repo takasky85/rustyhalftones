@@ -1,4 +1,5 @@
 //! Halftone engine. Pure `std`, no external crates, so it can be tested on its own.
+pub mod dither;
 pub mod export;
 pub mod layout;
 pub mod pages;

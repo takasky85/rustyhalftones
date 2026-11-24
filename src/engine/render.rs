@@ -140,6 +140,10 @@ impl<'a> PlateEval<'a> {
     /// Apply invert, dot-gain compensation and min/max/dropout to a raw ink value.
     fn adjust(&self, raw: f32) -> f32 {
         let p = &self.params;
+        if p.shape == DotShape::Bitmap {
+            // dithered rasters carry their curves already
+            return raw.clamp(0.0, 1.0);
+        }
         let mut t = raw.clamp(0.0, 1.0);
         if p.invert {
             t = 1.0 - t;
@@ -169,6 +173,12 @@ impl<'a> PlateEval<'a> {
         let region = self.region_at(x, y);
         if region < 0 {
             return false;
+        }
+        if region == 0 && self.params.shape == DotShape::Bitmap {
+            let r = self.image;
+            let u = ((x - r.x) / r.w).clamp(0.0, 1.0);
+            let v = ((y - r.y) / r.h).clamp(0.0, 1.0);
+            return self.pyr.nearest(u, v) > 0.5;
         }
         let (xd, yd) = (x as f64, y as f64);
         let u = xd * self.cos - yd * self.sin;
