@@ -661,7 +661,9 @@ mod gpu_tests {
             println!("no GPU adapter, skipping");
             return;
         };
+        eprintln!("stage: device ok, creating pipeline");
         let mut res = GpuResources::new(&device, wgpu::TextureFormat::Rgba8Unorm).expect("pipeline");
+        eprintln!("stage: pipeline ok");
 
         // a smooth gradient with some structure
         let (iw, ih) = (160usize, 120usize);
@@ -677,7 +679,9 @@ mod gpu_tests {
         let ts = ToneSettings { mode: SepMode::Mono, ..ToneSettings::default() };
         let maps = build_tone_maps(&src, &ts, 1024);
         let ink = GpuInk::from_maps(&maps).expect("ink");
+        eprintln!("stage: uploading ink {}x{}", ink.w, ink.h);
         res.set_ink(&device, &queue, &ink, 1);
+        eprintln!("stage: ink uploaded");
 
         let params = PlateParams {
             angle_deg: 30.0,
@@ -733,7 +737,9 @@ mod gpu_tests {
             srgb_target: false,
             layers: vec![layer],
         };
+        eprintln!("stage: rendering");
         let gpu = render_gpu(&device, &queue, &mut res, &frame, w, h);
+        eprintln!("stage: rendered");
 
         let mut bad = 0usize;
         let mut sum = 0.0f64;

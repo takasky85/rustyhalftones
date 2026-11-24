@@ -27,7 +27,7 @@ jobs:
       - name: GPU shader tests
         # Renders on a software adapter and compares with the CPU renderer. Informational.
         continue-on-error: true
-        run: cargo test --release --features gpu-tests gpu -- --nocapture
+        run: cargo test --release --features gpu-tests gpu -- --nocapture --test-threads=1
       - name: Build
         run: cargo build --release
       - name: Package
