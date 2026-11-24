@@ -25,6 +25,8 @@ const ANGLE_PRESETS: [(&str, [f32; 4]); 2] = [
 const DPI_CHOICES: [f32; 5] = [600.0, 1200.0, 1800.0, 2400.0, 2540.0];
 const WORK_RES_CHOICES: [usize; 5] = [1024, 2048, 3072, 4096, 6144];
 const UI_SCALES: [f32; 6] = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5];
+const RULER_SIZE: f32 = 22.0;
+const SCROLL_SIZE: f32 = 14.0;
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 200.0;
 /// Points per mm at "100%" (96 dpi).
@@ -42,6 +44,7 @@ const FIT_CHOICES: [(FitKind, &str); 4] = [
 enum Tool {
     Select,
     ZoomBox,
+    Hand,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -66,7 +69,7 @@ impl PageLayout {
 
     fn name(self) -> &'static str {
         match self {
-            PageLayout::Auto => "Automatic",
+            PageLayout::Auto => "Automatic (follows zoom)",
             PageLayout::Grid => "2 x 2 grid",
             PageLayout::Row => "One row",
             PageLayout::Column => "One column",
@@ -266,7 +269,9 @@ pub struct HalftoneApp {
     tab: Tab,
     sel_plate: usize,
     layout: PageLayout,
-    layout_res: PageLayout,
+    cols_res: usize,
+    zoom_dirty: bool,
+    show_rulers: bool,
     view_fit: bool,
     last_canvas_size: Vec2,
     zoom_start: Option<Pos2>,
@@ -430,7 +435,9 @@ impl HalftoneApp {
             tab: Tab::Layout,
             sel_plate: 0,
             layout: PageLayout::Auto,
-            layout_res: PageLayout::Grid,
+            cols_res: 2,
+            zoom_dirty: false,
+            show_rulers: true,
             view_fit: false,
             last_canvas_size: Vec2::ZERO,
             zoom_start: None,
@@ -516,13 +523,14 @@ impl HalftoneApp {
 
     fn settings_text(&self) -> String {
         format!(
-            "ui_scale={}\nunit={}\nlayout={}\nsafe_margin={}\nrenderer={}\nshow_safe={}\nshow_marks={}\nplate_colors={}\naa={}\nalways_dots={}\n",
+            "ui_scale={}\nunit={}\nlayout={}\nsafe_margin={}\nrenderer={}\nshow_safe={}\nrulers={}\nshow_marks={}\nplate_colors={}\naa={}\nalways_dots={}\n",
             self.ui_scale,
             if self.unit == Unit::Mm { "mm" } else { "in" },
             self.layout.key(),
             self.safe_margin,
             if self.gpu_enabled { "gpu" } else { "cpu" },
             self.show_safe,
+            self.show_rulers,
             self.show_marks,
             self.plate_colors,
             self.aa,
@@ -554,6 +562,7 @@ impl HalftoneApp {
                 }
                 "renderer" => self.gpu_enabled = v != "cpu" && !std::env::args().any(|a| a == "--cpu-preview"),
                 "show_safe" => self.show_safe = b,
+                "rulers" => self.show_rulers = b,
                 "show_marks" => self.show_marks = b,
                 "plate_colors" => self.plate_colors = b,
                 "aa" => self.aa = b,
@@ -930,36 +939,53 @@ impl HalftoneApp {
         self.slots.iter().any(|s| s.tex.is_some())
     }
 
+    /// Columns for a fixed page layout (Auto is decided by the view, see `auto_cols`).
+    fn fixed_cols(&self, layout: PageLayout) -> usize {
+        let n = self.plates.len().max(1);
+        match layout {
+            PageLayout::Row => n,
+            PageLayout::Column => 1,
+            _ => (n as f32).sqrt().ceil() as usize,
+        }
+    }
+
+    /// Column counts that fill every row evenly (1, 2 and 4 for four plates).
+    fn allowed_cols(&self) -> Vec<usize> {
+        let n = self.plates.len().max(1);
+        (1..=n).filter(|c| n % c == 0).collect()
+    }
+
+    fn page_gap(&self) -> f32 {
+        let (pw, ph) = self.page_mm();
+        0.08 * pw.max(ph)
+    }
+
     /// Top-left of each page in world millimetres. One page normally, one per plate in All plates.
-    fn offsets_for(&self, layout: PageLayout) -> Vec<(f32, f32)> {
+    fn offsets_cols(&self, cols: usize) -> Vec<(f32, f32)> {
         if self.view_mode != ViewMode::AllPlates {
             return vec![(0.0, 0.0)];
         }
         let (pw, ph) = self.page_mm();
         let n = self.plates.len().max(1);
-        let cols = match layout {
-            PageLayout::Row => n,
-            PageLayout::Column => 1,
-            _ => (n as f32).sqrt().ceil() as usize,
-        };
-        let gap = 0.08 * pw.max(ph);
+        let cols = cols.clamp(1, n);
+        let gap = self.page_gap();
         (0..n).map(|k| ((k % cols) as f32 * (pw + gap), (k / cols) as f32 * (ph + gap))).collect()
     }
 
     fn page_offsets(&self) -> Vec<(f32, f32)> {
-        self.offsets_for(self.layout_res)
+        self.offsets_cols(self.cols_res)
     }
 
-    fn world_size_for(&self, layout: PageLayout) -> (f32, f32) {
+    fn world_size_cols(&self, cols: usize) -> (f32, f32) {
         let (pw, ph) = self.page_mm();
-        let offs = self.offsets_for(layout);
+        let offs = self.offsets_cols(cols);
         let mx = offs.iter().map(|o| o.0).fold(0.0, f32::max);
         let my = offs.iter().map(|o| o.1).fold(0.0, f32::max);
         (mx + pw, my + ph)
     }
 
     fn world_size(&self) -> (f32, f32) {
-        self.world_size_for(self.layout_res)
+        self.world_size_cols(self.cols_res)
     }
 
     fn slot_view(&self, k: usize) -> ViewMode {
@@ -1137,6 +1163,7 @@ impl HalftoneApp {
         );
         self.view.fit_pending = false;
         self.view_fit = false;
+        self.zoom_dirty = true;
     }
 
     fn zoom_to(&mut self, canvas: egui::Rect, x: f32, y: f32, w: f32, h: f32) {
@@ -1150,6 +1177,7 @@ impl HalftoneApp {
         self.view.origin = (c - canvas.min) - p * z1;
         self.view.zoom = z1;
         self.view_fit = false;
+        self.zoom_dirty = true;
     }
 
     fn zoom_step(&mut self, f: f32) {
@@ -1168,6 +1196,21 @@ impl HalftoneApp {
         self.view.origin = vec2((c.width() - ww * z) * 0.5, 18.0);
         self.view.fit_pending = false;
         self.view_fit = false;
+        self.zoom_dirty = true;
+    }
+
+    fn fit_height_view(&mut self) {
+        let c = self.last_canvas;
+        let (ww, wh) = self.world_size();
+        if c.height() < 10.0 {
+            return;
+        }
+        let z = (c.height() * 0.96 / wh).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.view.zoom = z;
+        self.view.origin = vec2((c.width() - ww * z) * 0.5, (c.height() - wh * z) * 0.5);
+        self.view.fit_pending = false;
+        self.view_fit = false;
+        self.zoom_dirty = true;
     }
 
     fn actual_size(&mut self) {
@@ -1178,6 +1221,7 @@ impl HalftoneApp {
         self.view.zoom = z;
         self.view.origin = vec2(c.width() * 0.5 - center.0 * z, c.height() * 0.5 - center.1 * z);
         self.view_fit = false;
+        self.zoom_dirty = true;
     }
 
     fn zoom_image(&mut self) {
@@ -1223,21 +1267,53 @@ impl HalftoneApp {
         (DragKind::Pan, (0.0, 0.0))
     }
 
-    /// Pick the page arrangement that gives the biggest pages for the current canvas shape.
+    /// Pick the page arrangement for "fit page": the one that gives the biggest pages.
     fn resolve_layout(&mut self, canvas: egui::Rect) {
         if self.layout != PageLayout::Auto {
-            self.layout_res = self.layout;
+            self.cols_res = self.fixed_cols(self.layout);
             return;
         }
-        let mut best = (PageLayout::Grid, 0.0f32);
-        for l in [PageLayout::Grid, PageLayout::Row, PageLayout::Column] {
-            let (w, h) = self.world_size_for(l);
+        let mut best = (1usize, 0.0f32);
+        for c in self.allowed_cols() {
+            let (w, h) = self.world_size_cols(c);
             let score = (canvas.width() / w).min(canvas.height() / h);
             if score > best.1 * 1.02 {
-                best = (l, score);
+                best = (c, score);
             }
         }
-        self.layout_res = best.0;
+        self.cols_res = best.0;
+    }
+
+    /// Automatic layout follows the zoom: as many pages per row as fit the width (1, 2, then all).
+    /// The page in the middle of the view stays where it is while the others reflow around it.
+    fn apply_dynamic_layout(&mut self, canvas: egui::Rect) {
+        if self.layout != PageLayout::Auto || self.view_mode != ViewMode::AllPlates || self.plates.len() < 2 {
+            return;
+        }
+        let (pw, _) = self.page_mm();
+        let (z, gap) = (self.view.zoom.max(1e-4), self.page_gap());
+        let fit = (((canvas.width() / z + gap) / (pw + gap)).floor() as usize).max(1);
+        let new = self.allowed_cols().into_iter().filter(|&c| c <= fit).max().unwrap_or(1);
+        if new == self.cols_res {
+            return;
+        }
+        let old_offs = self.page_offsets();
+        let c = canvas.center() - canvas.min;
+        let wp = ((c.x - self.view.origin.x) / z, (c.y - self.view.origin.y) / z);
+        let (pw, ph) = self.page_mm();
+        let k = (0..old_offs.len())
+            .min_by(|&a, &b| {
+                let d = |k: usize| {
+                    let (dx, dy) = (wp.0 - (old_offs[k].0 + pw * 0.5), wp.1 - (old_offs[k].1 + ph * 0.5));
+                    dx * dx + dy * dy
+                };
+                d(a).total_cmp(&d(b))
+            })
+            .unwrap_or(0);
+        let local = (wp.0 - old_offs[k].0, wp.1 - old_offs[k].1);
+        self.cols_res = new;
+        let no = self.page_offsets()[k];
+        self.view.origin = vec2(c.x - (no.0 + local.0) * z, c.y - (no.1 + local.1) * z);
     }
 
     // ------------------------------------------------------------------ menus and toolbar
@@ -1319,6 +1395,7 @@ impl HalftoneApp {
                 ui.checkbox(&mut self.plate_colors, "Show plates in ink colour");
                 ui.checkbox(&mut self.show_marks, "Show printer's marks");
                 ui.checkbox(&mut self.show_safe, "Show safe margin");
+                ui.checkbox(&mut self.show_rulers, "Show rulers");
                 ui.checkbox(&mut self.aa, "Smooth dot edges");
                 ui.checkbox(&mut self.always_dots, "Always draw dots when zoomed out");
                 ui.separator();
@@ -1334,6 +1411,10 @@ impl HalftoneApp {
                 }
                 if ui.add(egui::Button::new("Fit width").shortcut_text("Ctrl+2")).clicked() {
                     self.fit_width_view();
+                    ui.close_menu();
+                }
+                if ui.add(egui::Button::new("Fit height").shortcut_text("Ctrl+3")).clicked() {
+                    self.fit_height_view();
                     ui.close_menu();
                 }
                 if ui.button("Zoom to image").clicked() {
@@ -1391,6 +1472,16 @@ impl HalftoneApp {
             }
             if icon_button(
                 ui,
+                Icon::Hand,
+                self.tool == Tool::Hand,
+                "Hand tool (H): drag to scroll. The middle button always scrolls",
+            )
+            .clicked()
+            {
+                self.tool = Tool::Hand;
+            }
+            if icon_button(
+                ui,
                 Icon::ZoomBox,
                 self.tool == Tool::ZoomBox,
                 "Zoom tool (Z): drag a box to zoom to it, click to zoom in, Shift+click to zoom out",
@@ -1411,6 +1502,9 @@ impl HalftoneApp {
             }
             if icon_button(ui, Icon::FitWidth, false, "Fit width (Ctrl+2)").clicked() {
                 self.fit_width_view();
+            }
+            if icon_button(ui, Icon::FitHeight, false, "Fit height (Ctrl+3)").clicked() {
+                self.fit_height_view();
             }
             if icon_button(ui, Icon::ZoomImage, false, "Zoom to the image").clicked() {
                 self.zoom_image();
@@ -1867,10 +1961,153 @@ impl HalftoneApp {
 
     // ------------------------------------------------------------------ canvas
 
+    /// Rulers in the current unit. With several pages each column and row restarts at zero.
+    fn draw_rulers(
+        &self,
+        p: &egui::Painter,
+        full: egui::Rect,
+        rect: egui::Rect,
+        org: Pos2,
+        offs: &[(f32, f32)],
+        hover: Option<Pos2>,
+    ) {
+        let (pw, ph) = self.page_mm();
+        let z = self.view.zoom;
+        let mm_per_unit = if self.unit == Unit::Inch { 25.4 } else { 1.0 };
+        let px_per_unit = z * mm_per_unit;
+        let steps = [0.01f32, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0];
+        let major = steps.iter().copied().find(|s| s * px_per_unit >= 70.0).unwrap_or(1000.0);
+        let minor = major / 5.0;
+        let show_minor = minor * px_per_unit >= 5.0;
+        let bg = Color32::from_gray(38);
+        let fg = Color32::from_gray(190);
+        let tick = Stroke::new(1.0, Color32::from_gray(150));
+        let font = egui::FontId::proportional(10.5);
+        let top = egui::Rect::from_min_max(pos2(rect.left(), full.top()), pos2(rect.right(), rect.top()));
+        let left = egui::Rect::from_min_max(pos2(full.left(), rect.top()), pos2(rect.left(), rect.bottom()));
+        let corner = egui::Rect::from_min_max(full.min, rect.min);
+        p.rect_filled(top, 0.0, bg);
+        p.rect_filled(left, 0.0, bg);
+        p.rect_filled(corner, 0.0, Color32::from_gray(30));
+        let label = |v: f32| format!("{}", (v * 1000.0).round() / 1000.0);
+
+        let mut xs: Vec<f32> = offs.iter().map(|o| o.0).collect();
+        xs.sort_by(|a, b| a.total_cmp(b));
+        xs.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+        let mut ys: Vec<f32> = offs.iter().map(|o| o.1).collect();
+        ys.sort_by(|a, b| a.total_cmp(b));
+        ys.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+
+        let pt = p.with_clip_rect(top);
+        for &ox in &xs {
+            let (lo, hi) = (((rect.left() - org.x) / z - ox).max(0.0), ((rect.right() - org.x) / z - ox).min(pw));
+            if hi <= lo {
+                continue;
+            }
+            let step = if show_minor { minor } else { major };
+            let k0 = (lo / mm_per_unit / step).ceil() as i64;
+            let k1 = (hi / mm_per_unit / step).floor() as i64;
+            for k in k0..=k1.min(k0 + 4000) {
+                let v = k as f32 * step;
+                let sx = org.x + (ox + v * mm_per_unit) * z;
+                let is_major = (v / major - (v / major).round()).abs() < 1e-3;
+                let len = if is_major { RULER_SIZE - 3.0 } else { 6.0 };
+                pt.line_segment([pos2(sx, top.bottom() - len), pos2(sx, top.bottom())], tick);
+                if is_major {
+                    pt.text(pos2(sx + 2.0, top.top() + 1.0), egui::Align2::LEFT_TOP, label(v), font.clone(), fg);
+                }
+            }
+        }
+        let pl = p.with_clip_rect(left);
+        for &oy in &ys {
+            let (lo, hi) = (((rect.top() - org.y) / z - oy).max(0.0), ((rect.bottom() - org.y) / z - oy).min(ph));
+            if hi <= lo {
+                continue;
+            }
+            let step = if show_minor { minor } else { major };
+            let k0 = (lo / mm_per_unit / step).ceil() as i64;
+            let k1 = (hi / mm_per_unit / step).floor() as i64;
+            for k in k0..=k1.min(k0 + 4000) {
+                let v = k as f32 * step;
+                let sy = org.y + (oy + v * mm_per_unit) * z;
+                let is_major = (v / major - (v / major).round()).abs() < 1e-3;
+                let len = if is_major { RULER_SIZE - 3.0 } else { 6.0 };
+                pl.line_segment([pos2(left.right() - len, sy), pos2(left.right(), sy)], tick);
+                if is_major {
+                    let g = pl.layout_no_wrap(label(v), font.clone(), fg);
+                    let at = pos2(left.left() + 2.0, sy + 2.0 + g.size().x);
+                    pl.add(egui::epaint::TextShape::new(at, g, fg).with_angle(-std::f32::consts::FRAC_PI_2));
+                }
+            }
+        }
+        if let Some(h) = hover {
+            let mark = Stroke::new(1.5, Color32::from_rgb(255, 170, 40));
+            if rect.contains(h) {
+                pt.line_segment([pos2(h.x, top.top()), pos2(h.x, top.bottom())], mark);
+                pl.line_segment([pos2(left.left(), h.y), pos2(left.right(), h.y)], mark);
+            }
+        }
+    }
+
+    /// Scroll bars over the world bounds, with half a window of slack on every side.
+    fn scrollbars(&mut self, ui: &mut egui::Ui, p: &egui::Painter, full: egui::Rect, rect: egui::Rect) {
+        let (ww, wh) = self.world_size();
+        let z = self.view.zoom;
+        let track_col = Color32::from_gray(46);
+        let thumb_col = |r: &egui::Response| {
+            if r.dragged() {
+                Color32::from_gray(170)
+            } else if r.hovered() {
+                Color32::from_gray(145)
+            } else {
+                Color32::from_gray(110)
+            }
+        };
+        p.rect_filled(egui::Rect::from_min_max(pos2(full.left(), rect.bottom()), full.max), 0.0, track_col);
+        p.rect_filled(egui::Rect::from_min_max(pos2(rect.right(), full.top()), full.max), 0.0, track_col);
+
+        // horizontal
+        {
+            let track = egui::Rect::from_min_max(pos2(rect.left(), rect.bottom()), pos2(rect.right(), full.bottom()));
+            let vw = rect.width();
+            let total = ww * z + vw;
+            let offset = -self.view.origin.x + vw * 0.5;
+            let len = (vw / total * track.width()).clamp(28.0, track.width());
+            let x = track.left() + (offset / total * track.width()).clamp(0.0, track.width() - len);
+            let thumb = egui::Rect::from_min_size(pos2(x, track.top() + 2.0), vec2(len, track.height() - 4.0));
+            let r = ui.interact(thumb, ui.id().with("hbar"), egui::Sense::drag());
+            if r.dragged() {
+                self.view.origin.x -= r.drag_delta().x * total / track.width().max(1.0);
+                self.view_fit = false;
+            }
+            p.rect_filled(thumb, 4.0, thumb_col(&r));
+        }
+        // vertical
+        {
+            let track = egui::Rect::from_min_max(pos2(rect.right(), rect.top()), pos2(full.right(), rect.bottom()));
+            let vh = rect.height();
+            let total = wh * z + vh;
+            let offset = -self.view.origin.y + vh * 0.5;
+            let len = (vh / total * track.height()).clamp(28.0, track.height());
+            let y = track.top() + (offset / total * track.height()).clamp(0.0, track.height() - len);
+            let thumb = egui::Rect::from_min_size(pos2(track.left() + 2.0, y), vec2(track.width() - 4.0, len));
+            let r = ui.interact(thumb, ui.id().with("vbar"), egui::Sense::drag());
+            if r.dragged() {
+                self.view.origin.y -= r.drag_delta().y * total / track.height().max(1.0);
+                self.view_fit = false;
+            }
+            p.rect_filled(thumb, 4.0, thumb_col(&r));
+        }
+    }
+
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let size = ui.available_size();
-        let (resp, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
-        let rect = resp.rect;
+        let (resp, full_painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
+        let full = resp.rect;
+        // The page area leaves room for the rulers (top, left) and the scroll bars (bottom, right).
+        let ruler = if self.show_rulers { RULER_SIZE } else { 0.0 };
+        let rect = egui::Rect::from_min_max(full.min + vec2(ruler, ruler), full.max - vec2(SCROLL_SIZE, SCROLL_SIZE));
+        let painter = full_painter.with_clip_rect(rect);
         self.last_canvas = rect;
         let ppp = ui.ctx().pixels_per_point();
         let (pw, ph) = self.page_mm();
@@ -1885,31 +2122,32 @@ impl HalftoneApp {
             self.view.fit_pending = true;
         }
         self.last_canvas_size = rect.size();
-        if self.view.fit_pending || self.view.zoom <= 0.0 {
-            self.resolve_layout(rect);
-        } else if self.layout != PageLayout::Auto {
-            self.layout_res = self.layout;
+        if self.layout != PageLayout::Auto {
+            self.cols_res = self.fixed_cols(self.layout);
         }
         if self.use_gpu() != self.gpu_prev {
             self.gpu_prev = self.use_gpu();
             self.reset_slots();
         }
-        let offs = self.page_offsets();
         if self.view.fit_pending || self.view.zoom <= 0.0 {
+            self.resolve_layout(rect);
             let (ww, wh) = self.world_size();
             self.zoom_to(rect, 0.0, 0.0, ww, wh);
             self.view_fit = true;
+            self.zoom_dirty = false;
         }
 
-        // wheel / pinch zoom
-        if resp.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            let pinch = ui.input(|i| i.zoom_delta());
-            let factor = (scroll * 0.0025).exp() * pinch;
-            if (factor - 1.0).abs() > 1e-4 {
+        // wheel scrolls, Ctrl+wheel (or a pinch) zooms
+        let in_page_area = resp.hover_pos().map_or(false, |p| rect.contains(p));
+        if in_page_area {
+            let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
+            if (pinch - 1.0).abs() > 1e-4 {
                 if let Some(c) = resp.hover_pos() {
-                    self.zoom_about(rect, c, factor);
+                    self.zoom_about(rect, c, pinch);
                 }
+            } else if scroll != Vec2::ZERO {
+                self.view.origin += scroll;
+                self.view_fit = false;
             }
         }
 
@@ -1928,7 +2166,7 @@ impl HalftoneApp {
             let z = self.view.zoom;
             let org = rect.min + self.view.origin;
             let to_w = |s: Pos2| ((s.x - org.x) / z, (s.y - org.y) / z);
-            if pressed && resp.hovered() {
+            if pressed && resp.hovered() && latest.map_or(false, |s| rect.contains(s)) {
                 if let Some(s) = latest {
                     match self.tool {
                         Tool::Select => {
@@ -1936,6 +2174,7 @@ impl HalftoneApp {
                             self.drag = Some(kind);
                             self.drag_off = off;
                         }
+                        Tool::Hand => self.drag = Some(DragKind::Pan),
                         Tool::ZoomBox => {
                             self.zoom_start = Some(s);
                             self.zoom_cur = Some(s);
@@ -1996,6 +2235,11 @@ impl HalftoneApp {
                 self.view_fit = false;
             }
         }
+        if self.zoom_dirty {
+            self.zoom_dirty = false;
+            self.apply_dynamic_layout(rect);
+        }
+        let offs = self.page_offsets();
 
         let z = self.view.zoom;
         let org = rect.min + self.view.origin;
@@ -2011,7 +2255,7 @@ impl HalftoneApp {
 
         // mouse cursor + handle under the pointer
         let mut hot_corner: Option<usize> = None;
-        if resp.hovered() || self.drag.is_some() {
+        if in_page_area || self.drag.is_some() {
             let kind = match self.drag {
                 Some(k) => Some(k),
                 None if self.tool == Tool::Select => resp.hover_pos().map(|p| self.hit_test(p, org, z).0),
@@ -2023,6 +2267,13 @@ impl HalftoneApp {
                         egui::CursorIcon::ZoomOut
                     } else {
                         egui::CursorIcon::ZoomIn
+                    }
+                }
+                (Tool::Hand, _) => {
+                    if self.drag.is_some() {
+                        egui::CursorIcon::Grabbing
+                    } else {
+                        egui::CursorIcon::Grab
                     }
                 }
                 (_, Some(DragKind::Resize { corner, .. })) => {
@@ -2041,7 +2292,7 @@ impl HalftoneApp {
         }
 
         // pages
-        painter.rect_filled(rect, 0.0, Color32::from_gray(58));
+        full_painter.rect_filled(full, 0.0, Color32::from_gray(58));
         let pages: Vec<egui::Rect> =
             offs.iter().map(|&(ox, oy)| egui::Rect::from_min_max(to_s(ox, oy), to_s(ox + pw, oy + ph))).collect();
         for page in &pages {
@@ -2250,6 +2501,11 @@ impl HalftoneApp {
             painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0, 120, 255, 40));
             painter.rect_stroke(r, 0.0, Stroke::new(1.5, blue), egui::StrokeKind::Inside);
         }
+
+        if self.show_rulers {
+            self.draw_rulers(&full_painter, full, rect, org, &offs, resp.hover_pos());
+        }
+        self.scrollbars(ui, &full_painter, full, rect);
     }
 }
 
@@ -2296,6 +2552,9 @@ impl eframe::App for HalftoneApp {
         if cmd(egui::Key::Num2) {
             self.fit_width_view();
         }
+        if cmd(egui::Key::Num3) {
+            self.fit_height_view();
+        }
         if cmd(egui::Key::Equals) || cmd(egui::Key::Plus) {
             self.zoom_step(1.25);
         }
@@ -2308,6 +2567,9 @@ impl eframe::App for HalftoneApp {
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Z)) {
                 self.tool = Tool::ZoomBox;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::H)) {
+                self.tool = Tool::Hand;
             }
         }
         if let ViewMode::Plate(i) = self.view_mode {

@@ -10,6 +10,8 @@ pub enum Icon {
     FitPage,
     FitWidth,
     ZoomImage,
+    Hand,
+    FitHeight,
 }
 
 pub fn icon_button(ui: &mut Ui, icon: Icon, selected: bool, tip: &str) -> Response {
@@ -73,6 +75,32 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, selected: bool, tip: &str) -> Respon
             p.line_segment([at(-11.0, 9.0), at(-7.0, 12.0)], st);
             p.line_segment([at(11.0, 9.0), at(7.0, 6.0)], st);
             p.line_segment([at(11.0, 9.0), at(7.0, 12.0)], st);
+        }
+        Icon::Hand => {
+            // palm and four fingers
+            p.rect_stroke(
+                egui::Rect::from_center_size(c + vec2(0.0, 5.0), vec2(16.0, 12.0)),
+                4.0,
+                st,
+                egui::StrokeKind::Middle,
+            );
+            for dx in [-6.0f32, -2.0, 2.0, 6.0] {
+                p.line_segment([at(dx, -1.0), at(dx, -9.0 - (dx.abs() < 3.0) as u8 as f32 * 2.0)], thick);
+            }
+            p.line_segment([at(-8.0, 6.0), at(-12.0, 1.0)], thick);
+        }
+        Icon::FitHeight => {
+            p.rect_stroke(
+                egui::Rect::from_center_size(c + vec2(-3.0, 0.0), vec2(16.0, 22.0)),
+                1.0,
+                st,
+                egui::StrokeKind::Middle,
+            );
+            p.line_segment([at(9.0, -11.0), at(9.0, 11.0)], st);
+            p.line_segment([at(9.0, -11.0), at(6.0, -7.0)], st);
+            p.line_segment([at(9.0, -11.0), at(12.0, -7.0)], st);
+            p.line_segment([at(9.0, 11.0), at(6.0, 7.0)], st);
+            p.line_segment([at(9.0, 11.0), at(12.0, 7.0)], st);
         }
         Icon::ZoomImage => {
             p.rect_stroke(egui::Rect::from_center_size(c, vec2(24.0, 24.0)), 1.0, st, egui::StrokeKind::Middle);
