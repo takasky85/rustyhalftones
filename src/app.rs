@@ -26,6 +26,8 @@ const WORK_RES_CHOICES: [usize; 5] = [1024, 2048, 3072, 4096, 6144];
 enum ViewMode {
     Composite,
     Plate(usize),
+    /// Every plate on its own page, laid out side by side.
+    AllPlates,
     Original,
 }
 
@@ -79,6 +81,7 @@ struct PreviewReq {
     ppmm: f32,
     dots: bool,
     aa: bool,
+    plate_colors: bool,
 }
 
 impl PreviewReq {
@@ -89,6 +92,7 @@ impl PreviewReq {
             && self.ppmm == o.ppmm
             && self.dots == o.dots
             && self.aa == o.aa
+            && self.plate_colors == o.plate_colors
             && self.region[0] <= vis[0] + 1e-3
             && self.region[1] <= vis[1] + 1e-3
             && self.region[0] + self.region[2] >= vis[2] - 1e-3
@@ -99,7 +103,7 @@ impl PreviewReq {
 enum Msg {
     Image { name: String, result: Result<SourceImage, String> },
     Maps { key: MapsKey, maps: Arc<ToneMaps> },
-    Preview { req: PreviewReq, ok: bool, w: usize, h: usize, rgba: Vec<u8> },
+    Preview { slot: usize, epoch: u64, req: PreviewReq, ok: bool, w: usize, h: usize, rgba: Vec<u8> },
     Export { result: Result<String, String> },
 }
 
@@ -122,6 +126,15 @@ struct TexInfo {
     y0: f32,
     w_mm: f32,
     h_mm: f32,
+}
+
+/// Preview state for one page (the All plates view has one per plate).
+#[derive(Default)]
+struct Slot {
+    tex: Option<TexInfo>,
+    have: Option<PreviewReq>,
+    inflight: Option<(PreviewReq, Arc<AtomicBool>)>,
+    pending: Option<PreviewReq>,
 }
 
 struct ExportState {
@@ -164,6 +177,9 @@ pub struct HalftoneApp {
     view: View,
     last_canvas: egui::Rect,
     drag: Option<DragKind>,
+    drag_off: (f32, f32),
+    plate_colors: bool,
+    prev_view_mode: ViewMode,
     cursor_mm: Option<(f32, f32)>,
     tone_mode: bool,
 
@@ -172,10 +188,9 @@ pub struct HalftoneApp {
     maps_key: Option<MapsKey>,
     maps_building: Option<MapsKey>,
     maps_rev: u64,
-    tex: Option<TexInfo>,
-    have: Option<PreviewReq>,
-    inflight: Option<(PreviewReq, Arc<AtomicBool>)>,
-    pending: Option<PreviewReq>,
+    slots: Vec<Slot>,
+    slot_epoch: u64,
+    slot_mode: ViewMode,
     orig_tex: Option<(u64, egui::TextureHandle)>,
 
     // export
@@ -252,10 +267,10 @@ fn render_job(req: &PreviewReq, maps: &ToneMaps, stale: &AtomicBool) -> (usize, 
             }
             ViewMode::Plate(k) => {
                 if i == k {
-                    layers.push((ev, [0.04; 3]));
+                    layers.push((ev, if req.plate_colors { p.ink } else { [0.04; 3] }));
                 }
             }
-            ViewMode::Original => {}
+            ViewMode::AllPlates | ViewMode::Original => {}
         }
     }
     let rgba = render_composite(&layers, &reg, req.dots, req.aa, stale);
@@ -295,16 +310,18 @@ impl HalftoneApp {
             view: View { zoom: 0.0, origin: Vec2::ZERO, fit_pending: true },
             last_canvas: egui::Rect::NOTHING,
             drag: None,
+            drag_off: (0.0, 0.0),
+            plate_colors: false,
+            prev_view_mode: ViewMode::Composite,
             cursor_mm: None,
             tone_mode: false,
             maps: None,
             maps_key: None,
             maps_building: None,
             maps_rev: 0,
-            tex: None,
-            have: None,
-            inflight: None,
-            pending: None,
+            slots: Vec::new(),
+            slot_epoch: 0,
+            slot_mode: ViewMode::Composite,
             orig_tex: None,
             exp_dpi: 1200.0,
             exp_mirror: false,
@@ -391,7 +408,7 @@ impl HalftoneApp {
         self.source_name = name;
         self.source_rev += 1;
         self.orig_tex = None;
-        self.tex = None;
+        self.reset_slots();
         self.fit_image(false);
     }
 
@@ -443,13 +460,16 @@ impl HalftoneApp {
                     self.maps_rev += 1;
                     self.maps_building = None;
                 }
-                Msg::Preview { req, ok, w, h, rgba } => {
-                    self.inflight = None;
+                Msg::Preview { slot, epoch, req, ok, w, h, rgba } => {
+                    if epoch != self.slot_epoch || slot >= self.slots.len() {
+                        continue;
+                    }
+                    self.slots[slot].inflight = None;
                     if ok {
                         let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
-                        let tex = ctx.load_texture("preview", img, egui::TextureOptions::LINEAR);
+                        let tex = ctx.load_texture(format!("preview{}", slot), img, egui::TextureOptions::LINEAR);
                         let px = 1.0 / req.ppmm;
-                        self.tex = Some(TexInfo {
+                        self.slots[slot].tex = Some(TexInfo {
                             tex,
                             x0: req.region[0],
                             y0: req.region[1],
@@ -457,7 +477,7 @@ impl HalftoneApp {
                             h_mm: h as f32 * px,
                         });
                         self.tone_mode = !req.dots;
-                        self.have = Some(req);
+                        self.slots[slot].have = Some(req);
                     }
                 }
                 Msg::Export { result } => {
@@ -490,21 +510,73 @@ impl HalftoneApp {
         });
     }
 
-    fn spawn_preview(&mut self, req: PreviewReq) {
+    fn reset_slots(&mut self) {
+        for sl in &self.slots {
+            if let Some((_, st)) = &sl.inflight {
+                st.store(true, Ordering::Relaxed);
+            }
+        }
+        self.slots.clear();
+        self.slot_epoch += 1;
+    }
+
+    fn any_inflight(&self) -> bool {
+        self.slots.iter().any(|s| s.inflight.is_some())
+    }
+
+    fn any_pending(&self) -> bool {
+        self.slots.iter().any(|s| s.pending.is_some())
+    }
+
+    fn any_tex(&self) -> bool {
+        self.slots.iter().any(|s| s.tex.is_some())
+    }
+
+    /// Top-left of each page in world millimetres. One page normally, one per plate in All plates.
+    fn page_offsets(&self) -> Vec<(f32, f32)> {
+        if self.view_mode != ViewMode::AllPlates {
+            return vec![(0.0, 0.0)];
+        }
+        let (pw, ph) = self.page_mm();
+        let n = self.plates.len().max(1);
+        let cols = if n >= 4 { 2 } else { n };
+        let gap = 0.08 * pw.max(ph);
+        (0..n).map(|k| ((k % cols) as f32 * (pw + gap), (k / cols) as f32 * (ph + gap))).collect()
+    }
+
+    fn world_size(&self) -> (f32, f32) {
+        let (pw, ph) = self.page_mm();
+        let offs = self.page_offsets();
+        let mx = offs.iter().map(|o| o.0).fold(0.0, f32::max);
+        let my = offs.iter().map(|o| o.1).fold(0.0, f32::max);
+        (mx + pw, my + ph)
+    }
+
+    fn slot_view(&self, k: usize) -> ViewMode {
+        if self.view_mode == ViewMode::AllPlates {
+            ViewMode::Plate(k)
+        } else {
+            self.view_mode
+        }
+    }
+
+    fn spawn_preview(&mut self, slot: usize, req: PreviewReq) {
         let Some(maps) = self.maps.clone() else { return };
         let stale = Arc::new(AtomicBool::new(false));
-        self.inflight = Some((req.clone(), stale.clone()));
+        self.slots[slot].inflight = Some((req.clone(), stale.clone()));
+        let epoch = self.slot_epoch;
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         thread::spawn(move || {
             let (w, h, rgba) = render_job(&req, &maps, &stale);
             let ok = !stale.load(Ordering::Relaxed);
-            let _ = tx.send(Msg::Preview { req, ok, w, h, rgba });
+            let _ = tx.send(Msg::Preview { slot, epoch, req, ok, w, h, rgba });
             ctx.request_repaint();
         });
     }
 
-    /// Make sure the preview texture covers `vis` (x0, y0, x1, y1 in mm) at the current zoom.
+    /// Make sure each visible page has a preview texture covering the visible part of it.
+    /// `vis` is (x0, y0, x1, y1) in world millimetres.
     fn update_preview(&mut self, vis: [f32; 4], ppp: f32) {
         if self.maps_key.map(|k| k.source_rev) != Some(self.source_rev) {
             return;
@@ -514,47 +586,67 @@ impl HalftoneApp {
         if maps.plates.len() != scene.plates.len() || self.view_mode == ViewMode::Original {
             return;
         }
+        let offs = self.page_offsets();
+        if self.slots.len() != offs.len() || self.slot_mode != self.view_mode {
+            self.reset_slots();
+            self.slots = (0..offs.len()).map(|_| Slot::default()).collect();
+            self.slot_mode = self.view_mode;
+        }
         let fast = self.drag.is_some();
-        let (vw, vh) = (vis[2] - vis[0], vis[3] - vis[1]);
-        let (ew, eh) = (vw * 1.2, vh * 1.2);
-        let mut ppmm = self.view.zoom * ppp * if fast { 0.5 } else { 1.0 };
-        let s = (4096.0 / (ew * ppmm)).min(4096.0 / (eh * ppmm)).min((7.0e6 / (ew * ppmm * eh * ppmm)).sqrt()).min(1.0);
-        ppmm = (ppmm * s).max(0.05);
-        ppmm = 2f32.powf((ppmm.log2() * 8.0).round() / 8.0);
-
-        let pitch = scene.plates.iter().map(|p| 25.4 / p.params.lpi.max(1.0)).fold(f32::MAX, f32::min);
-        let dots = (self.always_dots || pitch * ppmm >= 3.5) && !fast;
-
         let (pw, ph) = (scene.page_w, scene.page_h);
-        let x0 = (vis[0] - 0.1 * vw).max(0.0);
-        let y0 = (vis[1] - 0.1 * vh).max(0.0);
-        let x1 = (vis[2] + 0.1 * vw).min(pw);
-        let y1 = (vis[3] + 0.1 * vh).min(ph);
-        let wanted = PreviewReq {
-            scene,
-            maps_rev: self.maps_rev,
-            view: self.view_mode,
-            region: [x0, y0, x1 - x0, y1 - y0],
-            ppmm,
-            dots,
-            aa: self.aa,
-        };
-        if let Some(h) = &self.have {
-            if h.covers(&wanted, vis) {
-                self.pending = None;
-                return;
+        let pitch = scene.plates.iter().map(|p| 25.4 / p.params.lpi.max(1.0)).fold(f32::MAX, f32::min);
+        let (maps_rev, aa, plate_colors, always_dots, zoom) =
+            (self.maps_rev, self.aa, self.plate_colors, self.always_dots, self.view.zoom);
+
+        for (k, &(ox, oy)) in offs.iter().enumerate() {
+            let lv = [(vis[0] - ox).max(0.0), (vis[1] - oy).max(0.0), (vis[2] - ox).min(pw), (vis[3] - oy).min(ph)];
+            if lv[2] <= lv[0] || lv[3] <= lv[1] {
+                continue;
             }
-        }
-        if let Some((r, stale)) = &self.inflight {
-            if r.covers(&wanted, vis) {
-                return;
+            let (vw, vh) = (lv[2] - lv[0], lv[3] - lv[1]);
+            let (ew, eh) = (vw * 1.2, vh * 1.2);
+            let mut ppmm = zoom * ppp * if fast { 0.5 } else { 1.0 };
+            let s =
+                (4096.0 / (ew * ppmm)).min(4096.0 / (eh * ppmm)).min((7.0e6 / (ew * ppmm * eh * ppmm)).sqrt()).min(1.0);
+            ppmm = (ppmm * s).max(0.05);
+            ppmm = 2f32.powf((ppmm.log2() * 8.0).round() / 8.0);
+            let dots = (always_dots || pitch * ppmm >= 3.5) && !fast;
+
+            let x0 = (lv[0] - 0.1 * vw).max(0.0);
+            let y0 = (lv[1] - 0.1 * vh).max(0.0);
+            let x1 = (lv[2] + 0.1 * vw).min(pw);
+            let y1 = (lv[3] + 0.1 * vh).min(ph);
+            let wanted = PreviewReq {
+                scene: scene.clone(),
+                maps_rev,
+                view: self.slot_view(k),
+                region: [x0, y0, x1 - x0, y1 - y0],
+                ppmm,
+                dots,
+                aa,
+                plate_colors,
+            };
+            let slot = &mut self.slots[k];
+            if let Some(h) = &slot.have {
+                if h.covers(&wanted, lv) {
+                    slot.pending = None;
+                    continue;
+                }
             }
-            stale.store(true, Ordering::Relaxed);
+            if let Some((r, stale)) = &slot.inflight {
+                if r.covers(&wanted, lv) {
+                    continue;
+                }
+                stale.store(true, Ordering::Relaxed);
+            }
+            slot.pending = Some(wanted);
         }
-        self.pending = Some(wanted);
-        if self.inflight.is_none() {
-            if let Some(req) = self.pending.take() {
-                self.spawn_preview(req);
+        // One render at a time: each already uses every core.
+        if !self.any_inflight() {
+            if let Some(k) = self.slots.iter().position(|s| s.pending.is_some()) {
+                if let Some(req) = self.slots[k].pending.take() {
+                    self.spawn_preview(k, req);
+                }
             }
         }
     }
@@ -643,24 +735,35 @@ impl HalftoneApp {
         self.view.zoom = z1;
     }
 
-    fn hit_test(&self, s: Pos2, org: Pos2, z: f32) -> DragKind {
+    /// Returns what a press at screen point `s` grabs, and the top-left of the page it landed on.
+    fn hit_test(&self, s: Pos2, org: Pos2, z: f32) -> (DragKind, (f32, f32)) {
         if self.source.is_none() {
-            return DragKind::Pan;
+            return (DragKind::Pan, (0.0, 0.0));
         }
         let r = self.place;
-        let corners = [(r.x, r.y), (r.right(), r.y), (r.x, r.bottom()), (r.right(), r.bottom())];
-        for (i, &(cx, cy)) in corners.iter().enumerate() {
-            let sp = pos2(org.x + cx * z, org.y + cy * z);
-            if (sp - s).length() < 10.0 {
-                return DragKind::Resize { anchor: corners[3 - i], aspect: r.w / r.h.max(1e-3) };
+        let offs = self.page_offsets();
+        let (wx, wy) = ((s.x - org.x) / z, (s.y - org.y) / z);
+        for &(ox, oy) in &offs {
+            let c = [
+                (r.x + ox, r.y + oy),
+                (r.right() + ox, r.y + oy),
+                (r.x + ox, r.bottom() + oy),
+                (r.right() + ox, r.bottom() + oy),
+            ];
+            for (i, &(cx, cy)) in c.iter().enumerate() {
+                if (pos2(org.x + cx * z, org.y + cy * z) - s).length() < 10.0 {
+                    let a = c[3 - i];
+                    return (DragKind::Resize { anchor: (a.0 - ox, a.1 - oy), aspect: r.w / r.h.max(1e-3) }, (ox, oy));
+                }
             }
         }
-        let (px, py) = ((s.x - org.x) / z, (s.y - org.y) / z);
-        if r.contains(px, py) {
-            DragKind::Move { off: (px - r.x, py - r.y) }
-        } else {
-            DragKind::Pan
+        for &(ox, oy) in &offs {
+            let (px, py) = (wx - ox, wy - oy);
+            if r.contains(px, py) {
+                return (DragKind::Move { off: (px - r.x, py - r.y) }, (ox, oy));
+            }
         }
+        (DragKind::Pan, (0.0, 0.0))
     }
 
     // ------------------------------------------------------------------ UI
@@ -678,7 +781,8 @@ impl HalftoneApp {
                 self.rotate(true);
             }
         });
-        let name_label = if self.source_name.is_empty() { "No image loaded".to_string() } else { self.source_name.clone() };
+        let name_label =
+            if self.source_name.is_empty() { "No image loaded".to_string() } else { self.source_name.clone() };
         ui.label(name_label);
         ui.add_space(4.0);
 
@@ -900,6 +1004,7 @@ impl HalftoneApp {
             let label = match self.view_mode {
                 ViewMode::Composite => "Composite (overprint)".to_string(),
                 ViewMode::Plate(i) => format!("Plate {} (film positive)", names.get(i).cloned().unwrap_or_default()),
+                ViewMode::AllPlates => "All plates (separate pages)".to_string(),
                 ViewMode::Original => "Original image".to_string(),
             };
             egui::ComboBox::from_id_salt("view_mode").selected_text(label).show_ui(ui, |ui| {
@@ -911,8 +1016,10 @@ impl HalftoneApp {
                         format!("Plate {} (film positive)", n),
                     );
                 }
+                ui.selectable_value(&mut self.view_mode, ViewMode::AllPlates, "All plates (separate pages)");
                 ui.selectable_value(&mut self.view_mode, ViewMode::Original, "Original image");
             });
+            ui.checkbox(&mut self.plate_colors, "Show plates in ink colour (instead of black film)");
             ui.checkbox(&mut self.aa, "Smooth dot edges (2x2 samples)");
             ui.checkbox(&mut self.always_dots, "Always draw dots (even when zoomed out)");
             ui.horizontal(|ui| {
@@ -962,7 +1069,8 @@ impl HalftoneApp {
                 }
             }
             let can_export = self.export.is_none() && self.source.is_some() && (self.exp_pdf || self.exp_png);
-            if self.export.is_none() && ui.add_enabled(can_export, egui::Button::new("Export separations…")).clicked() {
+            if self.export.is_none() && ui.add_enabled(can_export, egui::Button::new("Export separations…")).clicked()
+            {
                 self.start_export();
             }
         });
@@ -987,7 +1095,7 @@ impl HalftoneApp {
             if self.tone_mode && self.source.is_some() && self.view_mode != ViewMode::Original {
                 ui.label("Zoomed out: showing tone. Zoom in to see the dots.");
             }
-            if self.maps_building.is_some() || self.inflight.is_some() || self.export.is_some() {
+            if self.maps_building.is_some() || self.any_inflight() || self.export.is_some() {
                 ui.add(egui::Spinner::new());
             }
         });
@@ -1000,8 +1108,16 @@ impl HalftoneApp {
         self.last_canvas = rect;
         let ppp = ui.ctx().pixels_per_point();
         let (pw, ph) = self.page_mm();
+        if self.prev_view_mode != self.view_mode {
+            if self.prev_view_mode == ViewMode::AllPlates || self.view_mode == ViewMode::AllPlates {
+                self.view.fit_pending = true;
+            }
+            self.prev_view_mode = self.view_mode;
+        }
+        let offs = self.page_offsets();
         if self.view.fit_pending || self.view.zoom <= 0.0 {
-            self.zoom_to(rect, 0.0, 0.0, pw, ph);
+            let (ww, wh) = self.world_size();
+            self.zoom_to(rect, 0.0, 0.0, ww, wh);
         }
 
         // zoom
@@ -1020,13 +1136,18 @@ impl HalftoneApp {
         {
             let z = self.view.zoom;
             let org = rect.min + self.view.origin;
-            let to_p = |s: Pos2| ((s.x - org.x) / z, (s.y - org.y) / z);
+            let to_w = |s: Pos2| ((s.x - org.x) / z, (s.y - org.y) / z);
             if resp.drag_started_by(egui::PointerButton::Primary) {
-                self.drag = resp.interact_pointer_pos().map(|s| self.hit_test(s, org, z));
+                if let Some(s) = resp.interact_pointer_pos() {
+                    let (kind, off) = self.hit_test(s, org, z);
+                    self.drag = Some(kind);
+                    self.drag_off = off;
+                }
             }
             if resp.dragged_by(egui::PointerButton::Primary) {
                 if let (Some(kind), Some(s)) = (self.drag, resp.interact_pointer_pos()) {
-                    let (px, py) = to_p(s);
+                    let (wx, wy) = to_w(s);
+                    let (px, py) = (wx - self.drag_off.0, wy - self.drag_off.1);
                     match kind {
                         DragKind::Pan => self.view.origin += resp.drag_delta(),
                         DragKind::Move { off } => {
@@ -1055,20 +1176,32 @@ impl HalftoneApp {
         let org = rect.min + self.view.origin;
         let to_s = |x: f32, y: f32| pos2(org.x + x * z, org.y + y * z);
         let to_p = |s: Pos2| ((s.x - org.x) / z, (s.y - org.y) / z);
-        self.cursor_mm = resp.hover_pos().map(to_p);
+        self.cursor_mm = resp.hover_pos().and_then(|p| {
+            let (wx, wy) = to_p(p);
+            if offs.len() == 1 {
+                return Some((wx, wy));
+            }
+            offs.iter().find(|o| wx >= o.0 && wx < o.0 + pw && wy >= o.1 && wy < o.1 + ph).map(|o| (wx - o.0, wy - o.1))
+        });
 
-        // page
+        // pages
         painter.rect_filled(rect, 0.0, Color32::from_gray(58));
-        let page = egui::Rect::from_min_max(to_s(0.0, 0.0), to_s(pw, ph));
-        painter.rect_filled(page.translate(vec2(4.0, 4.0)), 0.0, Color32::from_black_alpha(70));
-        painter.rect_filled(page, 0.0, Color32::WHITE);
+        let pages: Vec<egui::Rect> =
+            offs.iter().map(|&(ox, oy)| egui::Rect::from_min_max(to_s(ox, oy), to_s(ox + pw, oy + ph))).collect();
+        for page in &pages {
+            painter.rect_filled(page.translate(vec2(4.0, 4.0)), 0.0, Color32::from_black_alpha(70));
+            painter.rect_filled(*page, 0.0, Color32::WHITE);
+        }
 
-        let img_rect =
-            egui::Rect::from_min_max(to_s(self.place.x, self.place.y), to_s(self.place.right(), self.place.bottom()));
+        let place = self.place;
+        let img_rect = |ox: f32, oy: f32| {
+            egui::Rect::from_min_max(to_s(ox + place.x, oy + place.y), to_s(ox + place.right(), oy + place.bottom()))
+        };
+        let uv = egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 
         if self.source.is_none() {
             painter.text(
-                page.center(),
+                pages[0].center(),
                 egui::Align2::CENTER_CENTER,
                 "Open an image (Ctrl+O) or drop one here",
                 egui::FontId::proportional(18.0),
@@ -1085,27 +1218,24 @@ impl HalftoneApp {
                 }
             }
             if let Some((_, t)) = &self.orig_tex {
-                painter.image(
-                    t.id(),
-                    img_rect,
-                    egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+                painter.image(t.id(), img_rect(0.0, 0.0), uv, Color32::WHITE);
             }
         } else {
             let a = to_p(rect.min);
             let b = to_p(rect.max);
-            let vis = [a.0.max(0.0), a.1.max(0.0), b.0.min(pw), b.1.min(ph)];
-            if vis[2] > vis[0] && vis[3] > vis[1] {
-                self.update_preview(vis, ppp);
+            self.update_preview([a.0, a.1, b.0, b.1], ppp);
+            for (k, slot) in self.slots.iter().enumerate() {
+                if let (Some(t), Some(&(ox, oy))) = (&slot.tex, offs.get(k)) {
+                    let r = egui::Rect::from_min_max(
+                        to_s(ox + t.x0, oy + t.y0),
+                        to_s(ox + t.x0 + t.w_mm, oy + t.y0 + t.h_mm),
+                    );
+                    painter.image(t.tex.id(), r, uv, Color32::WHITE);
+                }
             }
-            if let Some(t) = &self.tex {
-                let r = egui::Rect::from_min_max(to_s(t.x0, t.y0), to_s(t.x0 + t.w_mm, t.y0 + t.h_mm));
-                painter.image(t.tex.id(), r, egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-            }
-            if self.maps_building.is_some() && self.tex.is_none() {
+            if self.maps_building.is_some() && !self.any_tex() {
                 painter.text(
-                    page.center(),
+                    pages[0].center(),
                     egui::Align2::CENTER_CENTER,
                     "Processing image…",
                     egui::FontId::proportional(18.0),
@@ -1114,50 +1244,84 @@ impl HalftoneApp {
             }
         }
 
+        // captions above each page in the All plates view
+        if self.view_mode == ViewMode::AllPlates {
+            for (k, page) in pages.iter().enumerate() {
+                if let Some(p) = self.plates.get(k) {
+                    let col = if self.plate_colors {
+                        Color32::from_rgb(p.ink[0], p.ink[1], p.ink[2])
+                    } else {
+                        Color32::from_gray(220)
+                    };
+                    painter.text(
+                        page.left_top() - vec2(0.0, 8.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        format!("Plate {}  {:.1} deg", p.name, p.angle),
+                        egui::FontId::proportional(16.0),
+                        col,
+                    );
+                }
+            }
+        }
+
         // marks
         if self.show_marks && self.source.is_some() {
-            let label = match self.view_mode {
-                ViewMode::Plate(i) if i < self.plates.len() => self.scene().label(i, &self.source_name),
-                _ => {
-                    let s = self.scene();
-                    let parts: Vec<String> =
-                        s.plates.iter().map(|p| format!("{} {:.1}deg", p.name, p.params.angle_deg)).collect();
-                    format!("{}  {:.0} lpi  {}", parts.join("  "), self.lpi, self.shape.name())
-                }
-            };
-            for pr in self.marks.prims(self.place, &label) {
-                match pr {
-                    Prim::Line { x1, y1, x2, y2, w } => {
-                        painter
-                            .line_segment([to_s(x1, y1), to_s(x2, y2)], Stroke::new((w * z).max(1.0), Color32::BLACK));
+            let scene = self.scene();
+            for (k, &(ox, oy)) in offs.iter().enumerate() {
+                let label = match self.view_mode {
+                    ViewMode::AllPlates if k < self.plates.len() => scene.label(k, &self.source_name),
+                    ViewMode::Plate(i) if i < self.plates.len() => scene.label(i, &self.source_name),
+                    _ => {
+                        let parts: Vec<String> =
+                            scene.plates.iter().map(|p| format!("{} {:.1}deg", p.name, p.params.angle_deg)).collect();
+                        format!("{}  {:.0} lpi  {}", parts.join("  "), self.lpi, self.shape.name())
                     }
-                    Prim::Ring { cx, cy, r, w } => {
-                        painter.circle_stroke(to_s(cx, cy), r * z, Stroke::new((w * z).max(1.0), Color32::BLACK));
-                    }
-                    Prim::Text { x, y, size_pt, text } => {
-                        painter.text(
-                            to_s(x, y),
-                            egui::Align2::LEFT_BOTTOM,
-                            text,
-                            egui::FontId::proportional((size_pt * 25.4 / 72.0 * z).clamp(7.0, 40.0)),
-                            Color32::BLACK,
-                        );
+                };
+                for pr in self.marks.prims(self.place, &label) {
+                    match pr {
+                        Prim::Line { x1, y1, x2, y2, w } => {
+                            painter.line_segment(
+                                [to_s(ox + x1, oy + y1), to_s(ox + x2, oy + y2)],
+                                Stroke::new((w * z).max(1.0), Color32::BLACK),
+                            );
+                        }
+                        Prim::Ring { cx, cy, r, w } => {
+                            painter.circle_stroke(
+                                to_s(ox + cx, oy + cy),
+                                r * z,
+                                Stroke::new((w * z).max(1.0), Color32::BLACK),
+                            );
+                        }
+                        Prim::Text { x, y, size_pt, text } => {
+                            painter.text(
+                                to_s(ox + x, oy + y),
+                                egui::Align2::LEFT_BOTTOM,
+                                text,
+                                egui::FontId::proportional((size_pt * 25.4 / 72.0 * z).clamp(7.0, 40.0)),
+                                Color32::BLACK,
+                            );
+                        }
                     }
                 }
             }
         }
 
-        // selection outline + handles
+        // selection outline + handles on every page (they all edit the same placement)
         if self.source.is_some() {
             let blue = Color32::from_rgb(0, 120, 255);
-            painter.rect_stroke(img_rect, 0.0, Stroke::new(1.0, blue), egui::StrokeKind::Outside);
-            for c in [img_rect.left_top(), img_rect.right_top(), img_rect.left_bottom(), img_rect.right_bottom()] {
-                let h = egui::Rect::from_center_size(c, vec2(9.0, 9.0));
-                painter.rect_filled(h, 0.0, Color32::WHITE);
-                painter.rect_stroke(h, 0.0, Stroke::new(1.0, blue), egui::StrokeKind::Inside);
+            for &(ox, oy) in &offs {
+                let ir = img_rect(ox, oy);
+                painter.rect_stroke(ir, 0.0, Stroke::new(1.0, blue), egui::StrokeKind::Outside);
+                for c in [ir.left_top(), ir.right_top(), ir.left_bottom(), ir.right_bottom()] {
+                    let h = egui::Rect::from_center_size(c, vec2(9.0, 9.0));
+                    painter.rect_filled(h, 0.0, Color32::WHITE);
+                    painter.rect_stroke(h, 0.0, Stroke::new(1.0, blue), egui::StrokeKind::Inside);
+                }
             }
         }
-        painter.rect_stroke(page, 0.0, Stroke::new(1.0, Color32::from_gray(30)), egui::StrokeKind::Outside);
+        for page in &pages {
+            painter.rect_stroke(*page, 0.0, Stroke::new(1.0, Color32::from_gray(30)), egui::StrokeKind::Outside);
+        }
     }
 }
 
@@ -1189,7 +1353,7 @@ impl eframe::App for HalftoneApp {
         });
         egui::CentralPanel::default().show(ctx, |ui| self.canvas(ui));
 
-        if self.maps_building.is_some() || self.inflight.is_some() || self.export.is_some() || self.pending.is_some() {
+        if self.maps_building.is_some() || self.any_inflight() || self.export.is_some() || self.any_pending() {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
     }

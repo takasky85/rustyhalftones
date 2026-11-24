@@ -25,11 +25,7 @@ fn main() {
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
-    let result = eframe::run_native(
-        "Rusty Halftones",
-        options,
-        Box::new(|cc| Ok(Box::new(app::HalftoneApp::new(cc)))),
-    );
+    let result = eframe::run_native("Rusty Halftones", options, Box::new(|cc| Ok(Box::new(app::HalftoneApp::new(cc)))));
     if let Err(e) = result {
         show_error(&format!("Could not start the graphics window:\n\n{}", e));
     }
