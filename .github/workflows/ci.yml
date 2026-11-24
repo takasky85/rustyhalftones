@@ -1,12 +1,70 @@
-name: CI
-on: [push, pull_request]
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            bin: rustyhalftones.exe
+          - name: macos-arm64
+            os: macos-latest
+            bin: rustyhalftones
+          - name: linux-x64
+            os: ubuntu-latest
+            bin: rustyhalftones
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: System libraries for egui/wgpu/rfd
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgtk-3-dev
-      - run: cargo build --release
-      - run: cargo test --release
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin }}" dist/
+          cp README.md dist/
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "../rustyhalftones-${{ matrix.name }}.zip" . > /dev/null
+          else
+            tar czf "../rustyhalftones-${{ matrix.name }}.tar.gz" .
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustyhalftones-${{ matrix.name }}
+          path: rustyhalftones-${{ matrix.name }}.*
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" artifacts/* --repo "${{ github.repository }}" --generate-notes
