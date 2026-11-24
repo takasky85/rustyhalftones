@@ -8,11 +8,12 @@ separations with printer's marks. Preview the halftone live, tweak it, then expo
 ## Features
 
 - **Page sizes**: Letter, Legal, Tabloid, 12x18, 13x19, 18x24, 20x24, 24x36, 5x7, 8x10, 11x14, 16x20, A0-A6, B4, B5, custom. Portrait or landscape, inches or mm.
-- **Image placement**: drag to move, drag corners to resize, lock aspect, set size by ppi, fit inside the marks, fill the page, rotate 90 degrees. EXIF orientation is honoured.
+- **Image placement**: drag to move, drag corners to resize, lock aspect, set size by ppi, rotate 90 degrees. Fit to page, fit width, fit height or fill page; fitting keeps the image and its printer's marks inside a safe margin (default 1/4 in) and re-fits when the page, marks or margin change. EXIF orientation is honoured.
 - **Separation**: single plate (greyscale) or CMYK with black generation. Brightness, contrast, gamma.
 - **Halftone controls**: lines per inch (with a mesh-count helper), dot shape (round, ellipse with elongation, Euclidean, diamond, square, rounded square, line), per-plate screen angle with presets, per-plate dot gain compensation, minimum dot, maximum dot, highlight dropout, invert, and optional per-plate lpi and shape.
 - **Printer's marks**: crop marks, registration targets, plate label (name, angle, lpi, shape), and a 12-step tone wedge per plate (nominal dot areas, so you can measure press gain).
-- **Preview**: composite overprint (multiply blend of the ink colours), any single plate as a film positive, or the original. Dots are drawn when you are zoomed in far enough to resolve them; zoomed out it shows tone instead of aliased moire.
+- **Preview**: composite overprint (multiply blend of the ink colours), any single plate as a film positive, all plates on separate pages (2x2, one row, one column or automatic), optionally in ink colours, or the original. Dots are drawn when you are zoomed in far enough to resolve them; zoomed out it shows tone instead of aliased moire. The preview runs on the GPU (a WGSL port of the engine), so dot size, lpi, angle, shape and dot gain update in real time. Options > Preview renderer switches to the CPU preview, which is also the automatic fallback; `--cpu-preview` forces it.
+- **Interface**: File/Edit/View/Options/Help menus, a toolbar with select and zoom-box tools, zoom in/out, fit page, fit width and a zoom percentage box, tabbed settings (Layout, Separation, Plates, Export), adjustable interface size.
 - **Export**: PDF with one page per plate (1-bit raster halftone plus vector marks and text) and/or one 1-bit PNG per plate, at 600-2540 dpi, optionally mirrored for emulsion-down film.
 
 ## Build and run
@@ -31,7 +32,11 @@ Needs a recent stable Rust. On Linux you need the usual windowing headers (see `
   - `render.rs` per-pixel halftone evaluation, preview compositor, 1-bit plate renderer
   - `layout.rs` rectangles, printer's marks, tone wedge
   - `export.rs` PDF and PNG writers
-- `src/app.rs` is the egui front end. Preview and export run on background threads.
+- `src/app.rs` is the egui front end. CPU preview and export run on background threads.
+- `src/gpu.rs` and `src/gpu.wgsl` are the GPU preview: ink maps uploaded as half-float mip chains, spot tables and per-plate parameters as uniforms, one fragment-shader draw per page through an egui paint callback.
+- `src/icons.rs` toolbar icons drawn with the painter.
+
+CI also runs `cargo test --features gpu-tests gpu`, which renders every dot shape on a (software) adapter and compares the result with the CPU renderer.
 
 ## How the halftone works
 
@@ -46,5 +51,7 @@ any shape. The tests check this to within 2% for every shape and angle.
 - Colour conversion is plain RGB to CMYK with no ICC profiles.
 - Spot-colour separations, stochastic (FM) screening and project save/load are not done yet.
 - PNG export draws the marks but not the text label (the PDF has the text).
+- Changing tone settings (brightness, contrast, gamma, black generation) still rebuilds the ink maps on the CPU before the GPU preview updates; screen settings are instant.
+- Settings (interface size, units, safe margin, renderer) are saved to `%APPDATA%\RustyHalftones\settings.txt`.
 - Planned: import from vectorcraft and Adobe Illustrator files. The engine treats the page as
   rectangular regions with a tone source (`PlateEval::tone_at`), which is where a vector source would plug in.
