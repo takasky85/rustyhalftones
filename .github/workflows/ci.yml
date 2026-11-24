@@ -18,19 +18,10 @@ jobs:
           - name: windows-x64
             os: windows-latest
             bin: rustyhalftones.exe
-          - name: macos-arm64
-            os: macos-latest
-            bin: rustyhalftones
-          - name: linux-x64
-            os: ubuntu-latest
-            bin: rustyhalftones
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: System libraries (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgtk-3-dev
       - name: Test
         run: cargo test --release
       - name: Build
@@ -42,11 +33,7 @@ jobs:
           cp "target/release/${{ matrix.bin }}" dist/
           cp README.md dist/
           cd dist
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "../rustyhalftones-${{ matrix.name }}.zip" . > /dev/null
-          else
-            tar czf "../rustyhalftones-${{ matrix.name }}.tar.gz" .
-          fi
+          7z a "../rustyhalftones-${{ matrix.name }}.zip" . > /dev/null
       - uses: actions/upload-artifact@v4
         with:
           name: rustyhalftones-${{ matrix.name }}
