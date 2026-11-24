@@ -144,6 +144,11 @@ impl Pyramid {
         Pyramid { levels }
     }
 
+    /// The full-resolution ink plane, row-major, 0..1.
+    pub fn base_data(&self) -> &[f32] {
+        &self.levels[0].2
+    }
+
     pub fn base_size(&self) -> (usize, usize) {
         (self.levels[0].0, self.levels[0].1)
     }

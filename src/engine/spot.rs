@@ -23,6 +23,19 @@ impl DotShape {
         DotShape::Line,
     ];
 
+    /// Index used by the GPU shader (same order as `ALL`).
+    pub fn id(self) -> u32 {
+        match self {
+            DotShape::Round => 0,
+            DotShape::Ellipse => 1,
+            DotShape::Euclidean => 2,
+            DotShape::Diamond => 3,
+            DotShape::Square => 4,
+            DotShape::RoundedSquare => 5,
+            DotShape::Line => 6,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             DotShape::Round => "Round",
@@ -101,6 +114,13 @@ impl SpotTable {
         }
         SpotTable { shape, elong, min, inv, cum }
     }
+
+    /// `(min, inv, cum)` for the GPU: the shader recomputes the spot value and looks `cum` up.
+    pub fn gpu_data(&self) -> (f32, f32, &[f32]) {
+        (self.min, self.inv, &self.cum)
+    }
+
+    pub const GPU_BINS: usize = BINS;
 
     #[inline]
     pub fn rank(&self, fx: f32, fy: f32) -> f32 {

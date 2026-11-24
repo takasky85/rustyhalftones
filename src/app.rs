@@ -13,8 +13,9 @@ use crate::engine::export::{export_all, ExportSpec, PlateOut};
 use crate::engine::layout::{MarkSettings, Prim, Rect as MmRect};
 use crate::engine::pages::{Unit, PAGE_SIZES};
 use crate::engine::render::{render_composite, PlateEval, PlateParams, PlateSetup, Region, Scene};
-use crate::engine::spot::DotShape;
+use crate::engine::spot::{DotShape, SpotTable};
 use crate::engine::tonemap::{build_tone_maps, SepMode, SourceImage, ToneMaps, ToneSettings};
+use crate::gpu::{self, FrameDesc, GpuInk, GpuResources, LayerDesc, PageCallback};
 use crate::icons::{icon_button, Icon};
 
 const ANGLE_PRESETS: [(&str, [f32; 4]); 2] = [
@@ -189,6 +190,7 @@ enum Msg {
     Image { name: String, result: Result<SourceImage, String> },
     Maps { key: MapsKey, maps: Arc<ToneMaps> },
     Preview { slot: usize, epoch: u64, req: PreviewReq, ok: bool, w: usize, h: usize, rgba: Vec<u8> },
+    GpuInk { rev: u64, src_rev: u64, ink: Option<Arc<GpuInk>> },
     Export { result: Result<String, String> },
 }
 
@@ -272,6 +274,21 @@ pub struct HalftoneApp {
     ui_scale: f32,
     show_about: bool,
     saved_settings: String,
+
+    // GPU preview
+    gpu_avail: bool,
+    gpu_enabled: bool,
+    gpu_note: String,
+    gpu_srgb: bool,
+    gpu_ink: Option<Arc<GpuInk>>,
+    gpu_ink_rev: u64,
+    gpu_ink_src: u64,
+    gpu_building: Option<u64>,
+    gpu_spots: Arc<Vec<f32>>,
+    gpu_spots_ver: u64,
+    gpu_spot_key: Vec<(DotShape, u32)>,
+    gpu_spot_params: Vec<(f32, f32)>,
+    gpu_prev: bool,
     view_mode: ViewMode,
     show_marks: bool,
     always_dots: bool,
@@ -421,6 +438,19 @@ impl HalftoneApp {
             ui_scale: 1.25,
             show_about: false,
             saved_settings: String::new(),
+            gpu_avail: false,
+            gpu_enabled: !std::env::args().any(|a| a == "--cpu-preview"),
+            gpu_note: String::new(),
+            gpu_srgb: false,
+            gpu_ink: None,
+            gpu_ink_rev: u64::MAX,
+            gpu_ink_src: u64::MAX,
+            gpu_building: None,
+            gpu_spots: Arc::new(Vec::new()),
+            gpu_spots_ver: 0,
+            gpu_spot_key: Vec::new(),
+            gpu_spot_params: Vec::new(),
+            gpu_prev: false,
             view_mode: ViewMode::Composite,
             show_marks: true,
             always_dots: false,
@@ -450,6 +480,17 @@ impl HalftoneApp {
         };
         s.reset_plates();
         s.load_settings();
+        match cc.wgpu_render_state.as_ref() {
+            Some(rs) => match GpuResources::new(&rs.device, rs.target_format) {
+                Ok(res) => {
+                    rs.renderer.write().callback_resources.insert(res);
+                    s.gpu_avail = true;
+                    s.gpu_srgb = rs.target_format.is_srgb();
+                }
+                Err(e) => s.gpu_note = format!("GPU preview unavailable: {}", e),
+            },
+            None => s.gpu_note = "GPU preview unavailable: no wgpu render state".to_string(),
+        }
         s.fit_key_last = s.fit_key();
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         cc.egui_ctx.set_zoom_factor(s.ui_scale);
@@ -475,11 +516,12 @@ impl HalftoneApp {
 
     fn settings_text(&self) -> String {
         format!(
-            "ui_scale={}\nunit={}\nlayout={}\nsafe_margin={}\nshow_safe={}\nshow_marks={}\nplate_colors={}\naa={}\nalways_dots={}\n",
+            "ui_scale={}\nunit={}\nlayout={}\nsafe_margin={}\nrenderer={}\nshow_safe={}\nshow_marks={}\nplate_colors={}\naa={}\nalways_dots={}\n",
             self.ui_scale,
             if self.unit == Unit::Mm { "mm" } else { "in" },
             self.layout.key(),
             self.safe_margin,
+            if self.gpu_enabled { "gpu" } else { "cpu" },
             self.show_safe,
             self.show_marks,
             self.plate_colors,
@@ -510,6 +552,7 @@ impl HalftoneApp {
                         self.safe_margin = x.clamp(0.0, 50.0);
                     }
                 }
+                "renderer" => self.gpu_enabled = v != "cpu" && !std::env::args().any(|a| a == "--cpu-preview"),
                 "show_safe" => self.show_safe = b,
                 "show_marks" => self.show_marks = b,
                 "plate_colors" => self.plate_colors = b,
@@ -693,6 +736,17 @@ impl HalftoneApp {
                         self.slots[slot].have = Some(req);
                     }
                 }
+                Msg::GpuInk { rev, src_rev, ink } => {
+                    self.gpu_building = None;
+                    self.gpu_ink_rev = rev;
+                    match ink {
+                        Some(i) => {
+                            self.gpu_ink = Some(i);
+                            self.gpu_ink_src = src_rev;
+                        }
+                        None => self.gpu_note = "Could not prepare the ink maps for the GPU".to_string(),
+                    }
+                }
                 Msg::Export { result } => {
                     self.export = None;
                     self.status = match result {
@@ -721,6 +775,137 @@ impl HalftoneApp {
             let _ = tx.send(Msg::Maps { key, maps: Arc::new(maps) });
             ctx.request_repaint();
         });
+    }
+
+    fn use_gpu(&self) -> bool {
+        self.gpu_avail && self.gpu_enabled
+    }
+
+    /// Convert the current ink maps to half-float mip chains for the GPU, off the UI thread.
+    fn maybe_build_gpu_ink(&mut self) {
+        if !self.use_gpu() || self.gpu_building.is_some() {
+            return;
+        }
+        let Some(maps) = self.maps.clone() else { return };
+        if self.gpu_ink.is_some() && self.gpu_ink_rev == self.maps_rev {
+            return;
+        }
+        let rev = self.maps_rev;
+        let src_rev = self.maps_key.map(|k| k.source_rev).unwrap_or(0);
+        self.gpu_building = Some(rev);
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        thread::spawn(move || {
+            let ink = GpuInk::from_maps(&maps).map(Arc::new);
+            let _ = tx.send(Msg::GpuInk { rev, src_rev, ink });
+            ctx.request_repaint();
+        });
+    }
+
+    fn refresh_spots(&mut self, scene: &Scene) {
+        let key: Vec<(DotShape, u32)> = scene
+            .plates
+            .iter()
+            .map(|p| (p.params.shape, if p.params.shape == DotShape::Ellipse { p.params.elong.to_bits() } else { 0 }))
+            .collect();
+        if key == self.gpu_spot_key {
+            return;
+        }
+        let tables: Vec<SpotTable> =
+            scene.plates.iter().map(|p| SpotTable::new(p.params.shape, p.params.elong)).collect();
+        let (data, params) = gpu::spot_tables(&tables);
+        self.gpu_spots = Arc::new(data);
+        self.gpu_spot_params = params;
+        self.gpu_spot_key = key;
+        self.gpu_spots_ver += 1;
+    }
+
+    /// Queue one GPU draw per visible page. Returns false while the ink maps are not ready.
+    fn paint_gpu(
+        &mut self,
+        painter: &egui::Painter,
+        pages: &[egui::Rect],
+        offs: &[(f32, f32)],
+        canvas: egui::Rect,
+        ppp: f32,
+        org: Pos2,
+    ) -> bool {
+        let n = self.plates.len();
+        let Some(ink) = self.gpu_ink.clone() else { return false };
+        if ink.plates != n || self.gpu_ink_src != self.source_rev {
+            return false;
+        }
+        let z = self.view.zoom;
+        let scene = self.scene();
+        self.refresh_spots(&scene);
+        let pitch = scene.plates.iter().map(|p| 25.4 / p.params.lpi.max(1.0)).fold(f32::MAX, f32::min);
+        let px_per_mm = z * ppp;
+        let dots = self.always_dots || pitch * px_per_mm >= 3.5;
+        self.tone_mode = !dots;
+        for (k, page) in pages.iter().enumerate() {
+            let vis = page.intersect(canvas);
+            if vis.width() < 1.0 || vis.height() < 1.0 {
+                continue;
+            }
+            let wanted: Vec<usize> = match self.view_mode {
+                ViewMode::Composite => (0..n).filter(|&i| scene.plates[i].visible).collect(),
+                ViewMode::Plate(i) => vec![i],
+                ViewMode::AllPlates => vec![k],
+                ViewMode::Original => Vec::new(),
+            };
+            let single = matches!(self.view_mode, ViewMode::Plate(_) | ViewMode::AllPlates);
+            let layers: Vec<LayerDesc> = wanted
+                .iter()
+                .filter(|&&i| i < n)
+                .map(|&i| {
+                    // the single-plate views show film (black) or the ink colour
+                    let col = if !single || self.plate_colors { scene.plates[i].ink } else { [0.04; 3] };
+                    let p = &scene.plates[i];
+                    let (smin, sinv) = self.gpu_spot_params.get(i).copied().unwrap_or((0.0, 1.0));
+                    LayerDesc {
+                        plate: i,
+                        ink: col,
+                        angle_deg: p.params.angle_deg,
+                        lpi: p.params.lpi,
+                        dot_gain: p.params.dot_gain,
+                        min_dot: p.params.min_dot,
+                        max_dot: p.params.max_dot,
+                        dropout: p.params.dropout,
+                        invert: p.params.invert,
+                        shape_id: p.params.shape.id(),
+                        elong: p.params.elong,
+                        spot_min: smin,
+                        spot_inv: sinv,
+                        patches: if scene.marks.wedge { scene.marks.wedge_patches(scene.image, i) } else { Vec::new() },
+                    }
+                })
+                .collect();
+            let (ox, oy) = offs.get(k).copied().unwrap_or((0.0, 0.0));
+            let frame = FrameDesc {
+                origin_px: [(org.x + ox * z) * ppp, (org.y + oy * z) * ppp],
+                px_per_mm,
+                image: scene.image,
+                page: (scene.page_w, scene.page_h),
+                dots,
+                aa: self.aa,
+                max_lod: (gpu::mip_count(ink.w, ink.h) - 1) as f32,
+                base_w: ink.w as f32,
+                srgb_target: self.gpu_srgb,
+                layers,
+            };
+            painter.add(gpu::callback_shape(
+                vis,
+                PageCallback {
+                    slot: k,
+                    frame: frame.to_floats(),
+                    ink: ink.clone(),
+                    ink_rev: self.gpu_ink_rev,
+                    spots: self.gpu_spots.clone(),
+                    spots_ver: self.gpu_spots_ver,
+                },
+            ));
+        }
+        true
     }
 
     fn reset_slots(&mut self) {
@@ -1166,6 +1351,15 @@ impl HalftoneApp {
                         if ui.radio_value(&mut self.ui_scale, s, format!("{:.0}%", s * 100.0)).clicked() {
                             ui.close_menu();
                         }
+                    }
+                });
+                ui.menu_button("Preview renderer", |ui| {
+                    ui.add_enabled_ui(self.gpu_avail, |ui| {
+                        ui.radio_value(&mut self.gpu_enabled, true, "GPU (realtime)");
+                    });
+                    ui.radio_value(&mut self.gpu_enabled, false, "CPU (compatible, slower)");
+                    if !self.gpu_note.is_empty() {
+                        ui.label(&self.gpu_note);
                     }
                 });
                 ui.menu_button("Units", |ui| {
@@ -1655,9 +1849,19 @@ impl HalftoneApp {
             if self.tone_mode && self.source.is_some() && self.view_mode != ViewMode::Original {
                 ui.label("Zoomed out: showing tone. Zoom in to see the dots.");
             }
-            if self.maps_building.is_some() || self.any_inflight() || self.export.is_some() {
+            if self.maps_building.is_some()
+                || self.gpu_building.is_some()
+                || self.any_inflight()
+                || self.export.is_some()
+            {
                 ui.add(egui::Spinner::new());
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let r = ui.label(if self.use_gpu() { "GPU preview" } else { "CPU preview" });
+                if !self.gpu_note.is_empty() {
+                    r.on_hover_text(&self.gpu_note);
+                }
+            });
         });
     }
 
@@ -1685,6 +1889,10 @@ impl HalftoneApp {
             self.resolve_layout(rect);
         } else if self.layout != PageLayout::Auto {
             self.layout_res = self.layout;
+        }
+        if self.use_gpu() != self.gpu_prev {
+            self.gpu_prev = self.use_gpu();
+            self.reset_slots();
         }
         let offs = self.page_offsets();
         if self.view.fit_pending || self.view.zoom <= 0.0 {
@@ -1867,6 +2075,17 @@ impl HalftoneApp {
             }
             if let Some((_, t)) = &self.orig_tex {
                 painter.image(t.id(), img_rect(0.0, 0.0), uv, Color32::WHITE);
+            }
+        } else if self.use_gpu() {
+            let ready = self.paint_gpu(&painter, &pages, &offs, rect, ppp, org);
+            if !ready {
+                painter.text(
+                    pages[0].center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Processing image…",
+                    egui::FontId::proportional(18.0),
+                    Color32::from_gray(120),
+                );
             }
         } else {
             let a = to_p(rect.min);
@@ -2111,6 +2330,7 @@ impl eframe::App for HalftoneApp {
         }
 
         self.maybe_build_maps();
+        self.maybe_build_gpu_ink();
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ui));
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -2141,7 +2361,12 @@ impl eframe::App for HalftoneApp {
             self.saved_settings = st;
         }
 
-        if self.maps_building.is_some() || self.any_inflight() || self.export.is_some() || self.any_pending() {
+        if self.maps_building.is_some()
+            || self.gpu_building.is_some()
+            || self.any_inflight()
+            || self.export.is_some()
+            || self.any_pending()
+        {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
     }

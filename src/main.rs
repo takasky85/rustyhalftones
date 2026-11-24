@@ -3,6 +3,7 @@
 mod app;
 mod compress;
 mod engine;
+mod gpu;
 mod icons;
 
 /// The release build has no console on Windows, so errors need a visible dialog.

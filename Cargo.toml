@@ -15,6 +15,12 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 rfd = "0.15"
 flate2 = "1"
+# Only used to wait on wgpu error scopes while building the preview pipeline.
+pollster = "0.4"
+
+[features]
+# Headless GPU vs CPU comparison tests (they need a GPU or software adapter).
+gpu-tests = []
 
 # The halftone loops are painfully slow at opt-level 0.
 [profile.dev]
