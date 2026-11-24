@@ -1,0 +1,29 @@
+[package]
+name = "rustyhalftones"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Halftone separation tool for screen printing (egui + wgpu)"
+
+[dependencies]
+# egui on the wgpu renderer (no glow)
+eframe = { version = "0.32", default-features = false, features = [
+    "default_fonts",
+    "wgpu",
+    "x11",
+    "wayland",
+    "accesskit",
+] }
+image = { version = "0.25", default-features = false, features = [
+    "jpeg", "png", "tiff", "bmp", "webp", "gif",
+] }
+rfd = "0.15"
+flate2 = "1"
+
+# The halftone loops are painfully slow at opt-level 0.
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
